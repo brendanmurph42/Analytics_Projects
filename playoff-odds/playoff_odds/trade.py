@@ -226,6 +226,22 @@ def run_models(ctx: Context, deltas: pd.DataFrame | None, models: list[str], sim
 # ----------------------------------------------------------------- trade value defaults
 
 
+def prior_war(player_id: int, season: int) -> list[float]:
+    """WAR in the three seasons before ``season`` (most recent first), 2020 at a 162-game pace."""
+    out = []
+    for j in (1, 2, 3):
+        w = float(players.season_war(season - j).get(player_id, 0.0))
+        out.append(w * 162 / 60 if season - j == 2020 else w)
+    return out
+
+
+def free_agent_contract(r, season: int, growth: float) -> contracts.FAContract:
+    """Predicted contract for a free agent (row with player_id, age, pos)."""
+    age = 30.0 if pd.isna(r.get("age")) else float(r.age)
+    wr = contracts.recent_war(prior_war(int(r.player_id), season))
+    return contracts.predict_fa_contract(age, wr, r.pos == "P", season, growth)
+
+
 def player_value_defaults(ctx: Context, rates: pd.DataFrame, growth: float,
                           custom_specs: dict[int, dict] | None = None) -> list[dict]:
     """Default trade-value inputs and surplus for each row of ``rates``.
@@ -262,7 +278,7 @@ def player_value_defaults(ctx: Context, rates: pd.DataFrame, growth: float,
                     pa = 450.0
             war_s = float(((r.proj_off_per_pa + r.def_per_pa) * pa + r.proj_pit_per_ip * ip) / rpw)
             svc, _ = contracts.player_history(pid, season)
-            priors = [float(players.season_war(season - j).get(pid, 0.0)) for j in (1, 2, 3)]
+            priors = prior_war(pid, season)
             pitcher = r.pos == "P"
         war_s = round(war_s, 1)
         control = contracts.default_control_years(svc, age)

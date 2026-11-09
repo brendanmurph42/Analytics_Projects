@@ -235,3 +235,105 @@ def player_history(player_id: int, season: int) -> tuple[float, list[int]]:
     prefetch_histories([player_id])
     h = _HISTORY[int(player_id)]
     return service_years(h["debut"], h["years"], season), sorted(h["years"])
+
+
+# ----------------------------------------------------------------- free-agent market
+#
+# Free agents are priced from actual signings rather than from every veteran's
+# salary: veterans on pre-free-agency extensions or backloaded deals make the
+# general comps run well below the open market. Two sources:
+#
+# * resources/recent_fa_signings.csv - major free-agent contracts from
+#   2022-2025 (hand-entered from public reporting; see recent_fa_contracts.csv)
+# * resources/fa_signings.csv - 2000-2016 signings inferred from Lahman
+#   (veterans who changed teams with a new salary; annual value = average
+#   salary over their first seasons with the new club)
+#
+# Since 2016 the league-average salary has barely grown while good free agents'
+# prices kept rising, so relative to the average a 3+ WAR free agent now costs
+# far more than in the Lahman era. Older signings are scaled up by that measured
+# gap (full gap at 3+ WAR, none at 1 WAR or below, where recent data is too thin
+# and selective to measure it). A free agent's annual value is the
+# distance-weighted average (in logs) of his 20 nearest signings by age, recent
+# WAR and pitcher/hitter, with recent signings counted triple. His contract
+# length comes from his nearest recent signings.
+
+K_FA = 20
+RECENT_WEIGHT = 3.0
+
+
+def _sig_dist(pool: pd.DataFrame, age: float, war: float, pitcher: bool) -> np.ndarray:
+    return np.sqrt(((pool.age - age) / 3.0) ** 2 + ((pool.war_recent - war) / 0.8) ** 2
+                   + ((pool.pitcher - int(pitcher)) * 0.7) ** 2).to_numpy()
+
+
+def _knn_log(pool: pd.DataFrame, age, war, pitcher, k, col="log_mult", weight_col=None):
+    d = _sig_dist(pool, age, war, pitcher)
+    idx = np.argsort(d)[:k]
+    w = 1.0 / (d[idx] + 0.3)
+    if weight_col is not None:
+        w = w * pool[weight_col].to_numpy()[idx]
+    return float((pool[col].to_numpy()[idx] * w).sum() / w.sum()), pool.iloc[idx].assign(distance=d[idx])
+
+
+@lru_cache(maxsize=1)
+def _signing_pools() -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    """(recent signings, era-adjusted Lahman signings, measured era gap in logs)."""
+    rec = pd.read_csv(RES / "recent_fa_signings.csv")
+    lah = pd.read_csv(RES / "fa_signings.csv")
+    lah = lah[lah.war_recent > -1.5].copy()
+    rec["log_mult"] = np.log(rec.aav_index)
+    lah["log_mult"] = np.log(lah.aav_index)
+    # gap = how far recent 3+ WAR signings sit above what the Lahman-era market would pay
+    gaps = []
+    for r in rec[rec.war_recent >= 3].itertuples():
+        pred, _ = _knn_log(lah, r.age, r.war_recent, r.pitcher, K_FA)
+        gaps.append(r.log_mult - pred)
+    gap = float(np.median(gaps)) if gaps else 0.0
+    lah["log_mult"] = lah.log_mult + gap * np.clip((lah.war_recent - 1.0) / 2.0, 0.0, 1.0)
+    lah["source"] = "2000–16 (era-adjusted)"
+    rec["source"] = "2022–25"
+    lah["w"], rec["w"] = 1.0, RECENT_WEIGHT
+    return rec, lah, gap
+
+
+def era_gap() -> float:
+    """Measured premium of today's market over 2000-16 for 3+ WAR free agents (multiplier)."""
+    return float(np.exp(_signing_pools()[2]))
+
+
+@dataclass
+class FAContract:
+    aav: float              # $M per year in the signing season
+    years: int
+    multiple: float         # x league-average salary
+    comps: pd.DataFrame
+
+
+def predict_fa_contract(age: float, war_recent: float, pitcher: bool, year: int,
+                        growth: float | None = None, exclude: tuple[str, int] | None = None) -> FAContract:
+    rec, lah, _ = _signing_pools()
+    if exclude is not None:
+        rec = rec[~((rec.name == exclude[0]) & (rec.year == exclude[1]))]
+    pool = pd.concat([rec, lah], ignore_index=True)
+    log_mult, near = _knn_log(pool, age, war_recent, pitcher, K_FA, weight_col="w")
+    mult = float(np.exp(log_mult))
+    # contract length from the nearest recent signings (Lahman tenure isn't contract length)
+    # pitchers sign shorter deals than hitters of the same age and value, so a
+    # pitcher's length comes from pitchers (hitters can borrow from either)
+    d = np.sqrt(((rec.age - age) / 3.0) ** 2 + ((rec.war_recent - war_recent) / 0.8) ** 2
+                + ((rec.pitcher - int(pitcher)) * (3.0 if pitcher else 0.7)) ** 2).to_numpy()
+    idx = np.argsort(d)[:7]
+    w = 1.0 / (d[idx] + 0.3)
+    yrs = rec.years.to_numpy()[idx]
+    order = np.argsort(yrs)
+    cum = np.cumsum(w[order]) / w.sum()
+    rec_years = float(yrs[order][np.searchsorted(cum, 0.5)])     # weighted median
+    # For lower-tier players the recent list only holds unusually big deals, so
+    # blend toward how long comparable 2000-16 signings stayed with their club.
+    d_l = _sig_dist(lah, age, war_recent, pitcher)
+    old_years = float(np.median(lah.years.to_numpy()[np.argsort(d_l)[:K_FA]]))
+    wr = float(np.clip((war_recent - 1.0) / 2.0, 0.0, 1.0))
+    years = int(round(wr * rec_years + (1 - wr) * old_years))
+    aav = max(mult * avg_salary(year, growth), min_salary(year, growth))
+    return FAContract(aav, max(years, 1), mult, near)

@@ -52,8 +52,9 @@ def free_agent_table(as_of: date, growth: float) -> pd.DataFrame:
     r["to_id"] = ctx.teams.team_id.iloc[0]   # placeholder; value doesn't depend on the club here
     d = trade.player_value_defaults(ctx, r, growth)
     r["war_season"] = [x["war_season"] for x in d]
-    r["fa_salary"] = [x["salary"] for x in d]
-    r["fa_years"] = [x["control"] + 1 for x in d]
+    fac = [trade.free_agent_contract(row, ctx.season, growth) for _, row in r.iterrows()]
+    r["fa_salary"] = [round(c.aav, 1) for c in fac]
+    r["fa_years"] = [c.years for c in fac]
     return r.sort_values("war_season", ascending=False).set_index("player_id", drop=False)
 
 
@@ -212,9 +213,12 @@ if len(fat):
                 f"{money(r.fa_salary)}/yr × {int(r.fa_years)} · last with {r.last_team}")
     with st.expander(f"✍️ Sign free agents ({len(fat)} unsigned players who played in the majors recently)",
                      expanded=offseason):
-        st.caption("Sorted by projected WAR for a full season. Contract terms are predicted from historical "
-                   "comparable free agents and can be edited under Trade value. Signings change the signing "
-                   "team's depth chart and odds. The other team isn't affected.")
+        st.caption(
+            "Sorted by projected WAR for a full season. Contracts are predicted from his 20 most similar actual "
+            "free-agent signings: major 2022–25 deals, plus 2000–16 signings scaled up "
+            f"{contracts.era_gap():.2f}× for today's market (the measured gap for 3+ WAR players). "
+            "Edit them under Trade value. Signings change the signing team's depth chart and odds, and the "
+            "other team isn't affected.")
         c1, c2 = st.columns(2)
         with c1:
             fa_a = st.multiselect(f"{teams.loc[team_a, 'short']} sign", list(fat.index), format_func=fa_label,
@@ -626,7 +630,24 @@ if deal_rows:
         contract_rows.append((r["name"], pth, salary_used))
 
     with st.expander("Contract predictions and comparable players"):
-        for name, pth, used in contract_rows:
+        for k, (name, pth, used) in enumerate(contract_rows):
+            if rates.kind.iloc[k] == "free agent":
+                fac = trade.free_agent_contract(rates.iloc[k], season, growth)
+                st.markdown(f"**{name}**: free agent, predicted **${fac.aav:.1f}M/yr × {fac.years} years** "
+                            f"({fac.multiple:.1f}× the league-average salary)")
+                c = fac.comps.head(8).copy()
+                c["mult"] = np.exp(c.log_mult)
+                c[f"In {season} $"] = c.mult * contracts.avg_salary(season, growth)
+                st.dataframe(
+                    c[["name", "year", "source", "age", "war_recent", "mult", f"In {season} $", "years"]].rename(
+                        columns={"name": "Comparable signing", "year": "Year", "source": "Source", "age": "Age",
+                                 "war_recent": "Recent WAR", "mult": "× avg", "years": "Years"}),
+                    hide_index=True, width="stretch",
+                    column_config={"Recent WAR": st.column_config.NumberColumn(format="%.1f"),
+                                   "Age": st.column_config.NumberColumn(format="%.0f"),
+                                   "× avg": st.column_config.NumberColumn(format="%.2f×"),
+                                   f"In {season} $": st.column_config.NumberColumn(format="$%.1fM")})
+                continue
             yrs = [season + y for y in range(len(pth.salaries))]
             st.markdown(f"**{name}**: {pth.first.cls}, about {pth.first.multiple:.2f}× the league-average salary")
             line = " · ".join(f"{y}: ${s_:.1f}M" for y, s_ in zip(yrs, pth.salaries))
@@ -879,7 +900,9 @@ Runs per win: **{c.runs_per_win:.2f}**.
 role his projection earns, the players behind him lose playing time, and the departing player's time
 goes to whoever is next on the depth chart. The full-season change in team strength applies to whatever
 games remain. Free agents are anyone with no club on the date who played in the majors this season or
-last. Their default contract comes from historical comparable free agents.
+last. Their default contract comes from their 20 most similar actual free-agent signings: major 2022–25
+deals, plus 2000–16 signings scaled up for today's market, where 3+ WAR players now cost about 1.5× more
+relative to the league average. Contract length comes from the nearest recent signings.
 
 **Custom players.** You describe a custom player's talent directly, as a WAR pace (per 650 PA, or per
 180 IP for starters and 65 IP for relievers) or as a rate stat (wRC+ for hitters, FIP or ERA for pitchers).

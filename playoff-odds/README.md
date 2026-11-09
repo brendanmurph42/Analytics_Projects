@@ -69,6 +69,17 @@ MLB's public data has no contracts, so salaries are **predicted from comparable 
 3. Each comp's salary is stored as a **multiple of that season's league-average salary**, which strips out inflation. The median multiple is applied to the league average for each target season. Known averages (AP opening-day study) run through 2025, and later seasons **grow at the long-run trend**: about 3.4% a year over the last 20 years, adjustable in the sidebar.
 4. Pre-arb and arbitration players are re-predicted every season, so raises show up. A veteran's salary is predicted once and held flat, like a signed contract.
 
+### Free-agent contracts
+
+Free agents are priced from **actual free-agent signings**, not from every veteran's salary. Veterans on pre-free-agency extensions or backloaded deals make general comps run well below the open market. There are two sources:
+
+- **2022–25:** 55 major free-agent contracts, hand-entered from public reporting in `playoff_odds/resources/recent_fa_contracts.csv` (please double-check them). Their pre-signing WAR, age and service are computed by `scripts/build_recent_fa.py`.
+- **2000–16:** about 1,600 signings inferred from Lahman: veterans who changed teams with a new salary. Annual value is the average salary over their first seasons with the new club.
+
+Since 2016, the league-average salary barely grew ($4.4M → $5.2M) while good free agents' prices kept rising. Recent 3+ WAR signings ran about 1.5× what the 2000–16 market would have paid relative to the average, so older signings are scaled up by that measured gap (fully at 3+ WAR, not at all at 1 WAR or below). A free agent's annual value comes from his 20 nearest signings by age, recent WAR, and pitcher/hitter, with recent deals counted triple. Contract length comes from his nearest recent signings (pitchers match pitchers), blended toward 2000–16 tenure for lower-tier players.
+
+**Leave-one-out on the recent contracts:** for 4+ WAR free agents the typical error is about 15% with no bias, versus 42% too low for the general comps. For example, Judge is predicted at $37.5M (actual $40M), Correa at $29M ($33M), and Freeman at $29.5M ($27M). Contract length is typically within a year. Soto's record $51M is underpredicted at about $40M. Lower-tier predictions run about 25% below the recent list, but that list only includes notable deals.
+
 On held-out 2014–2016 salaries (predicted only from 2000–2013 comps), the typical error is about 18%, and 83% of predictions land within 2x of the actual salary. Errors are largest for stars on early extensions, so type the real figure in the salary column when you know it. The **Contract predictions** expander shows each player's salary path and closest comps.
 
 Each team's net = value received − value sent + a **contender premium**: the team's change in playoff odds × the value of a playoff spot (default $40M, set in the sidebar). This lets a contender overpay for help now, and it costs a contending seller something to weaken itself.

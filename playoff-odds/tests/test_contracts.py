@@ -47,3 +47,28 @@ def test_path_gives_arb_raises_and_flat_free_agent_salary():
     assert young.salaries[0] < young.salaries[-1]           # raises through arbitration
     vet = C.salary_path(31, 8.0, [4.0, 4.0, 4.0], [4.0, 3.5, 3.0], False, 2025)
     assert len(set(np.round(vet.salaries, 6))) == 1          # free-agent deal is flat
+
+
+def test_fa_market_prices_stars_above_general_comps():
+    fa = C.predict_fa_contract(30, 6.0, True, 2027)
+    general = C.predict_salary(30, 9.0, 6.0, True, 2027)
+    assert fa.aav > 1.4 * general.salary
+    assert 6 < fa.multiple < 9                     # elite FA ~ 6-9x the league average
+    assert C.era_gap() > 1.2                       # today's market above the 2000-16 pattern
+
+
+def test_fa_market_is_monotonic_and_lengths_sensible():
+    aavs = [C.predict_fa_contract(30, w, False, 2027).aav for w in (0.5, 2, 4, 6)]
+    assert aavs == sorted(aavs)
+    assert C.predict_fa_contract(26, 6.5, False, 2027).years >= 8      # young star: long deal
+    assert C.predict_fa_contract(35, 0.5, False, 2027).years <= 2      # fringe veteran: short
+
+
+def test_fa_market_leave_one_out_on_recent_top_signings():
+    import pandas as pd
+    rec = pd.read_csv(C.RES / "recent_fa_signings.csv")
+    top = rec[rec.war_recent >= 4]
+    errs = [np.log(C.predict_fa_contract(r.age, r.war_recent, bool(r.pitcher), r.year,
+                                         exclude=(r.name, r.year)).aav / r.aav_m) for r in top.itertuples()]
+    assert abs(np.median(errs)) < 0.15
+    assert np.median(np.abs(errs)) < 0.30

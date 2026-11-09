@@ -13,6 +13,10 @@ Usage (one-time; the CSV is committed so the app doesn't need this):
     mkdir -p /tmp/lahman && tar -xzf /tmp/lahman.tar.gz -C /tmp/lahman
     .venv/bin/python scripts/build_contract_comps.py /tmp/lahman/Lahman/data
 
+Also writes resources/fa_signings.csv: veterans who changed teams with a new
+contract, with the average salary over their first seasons with the new club
+(a proxy for the contract's annual value) and how long they stayed.
+
 Data: Lahman Baseball Database (SABR), CC BY-SA 3.0.
 """
 
@@ -124,6 +128,57 @@ def main(data_dir: str) -> None:
     dest = ROOT / "playoff_odds" / "resources" / "contract_comps.csv"
     dest.parent.mkdir(exist_ok=True)
     out.to_csv(dest, index=False)
+
+    # --- free-agent signings: veterans who changed teams with a real salary change.
+    # Lahman has no transaction data. A team change with the salary moving more
+    # than ~15% separates new deals from players traded mid-contract, and the
+    # average salary over his first (up to five) seasons with the new club
+    # approximates the contract's annual value (first-year salaries are often
+    # backloaded or deferred).
+    st = sal[sal.yearID >= FIRST_SALARY_YEAR - 1].sort_values("salary")
+    teams_n = st.groupby(["playerID", "yearID"]).teamID.nunique()
+    main_team = st.groupby(["playerID", "yearID"]).teamID.last()          # highest-paid stint
+    tot = st.groupby(["playerID", "yearID"]).salary.sum()
+    idx_of = out.set_index(["name", "year"])                               # features by name/year
+    key = {(r.playerID, int(r.yearID)): r for r in s.itertuples()}
+    last_year = int(sal.yearID.max())
+    fa_rows = []
+    for pid, grp in main_team.groupby(level=0):
+        yrs = sorted(int(y) for y in grp.index.get_level_values(1))
+        team = {int(y): grp.loc[(pid, y)] for y in yrs}
+        for y in yrs:
+            if y < FIRST_SALARY_YEAR or (y - 1) not in team or teams_n[(pid, y)] > 1:
+                continue
+            if team[y] == team[y - 1]:
+                continue
+            change = abs(np.log(tot[(pid, y)] / max(tot[(pid, y - 1)], 1)))
+            if change < 0.15 or (pid, y) not in key or pid not in ppl.index:
+                continue
+            nm = f"{ppl.at[pid, 'nameFirst']} {ppl.at[pid, 'nameLast']}"
+            if (nm, y) not in idx_of.index:
+                continue
+            feat = idx_of.loc[(nm, y)]
+            if isinstance(feat, pd.DataFrame):
+                feat = feat.iloc[0]
+            if feat.service < 5.5:
+                continue
+            tenure = []
+            for k in range(5):
+                yy = y + k
+                if yy in team and team[yy] == team[y] and teams_n[(pid, yy)] == 1 and (pid, yy) in key:
+                    tenure.append(key[(pid, yy)].salary_index)
+                else:
+                    break
+            fa_rows.append({
+                "name": nm, "year": y, "age": int(feat.age), "war_recent": feat.war_recent,
+                "pitcher": int(feat.pitcher), "service": feat.service,
+                "aav_index": round(float(np.mean(tenure)), 4), "years": len(tenure),
+                "censored": int(y + len(tenure) - 1 >= last_year),
+                "first_salary_m": round(tot[(pid, y)] / 1e6, 3),
+            })
+    fa = pd.DataFrame(fa_rows)
+    fa.to_csv(dest.parent / "fa_signings.csv", index=False)
+    print(f"wrote {len(fa):,} free-agent signings")
 
     avg = lg_avg[lg_avg.index >= 1985].round(4)
     avg.rename("avg_salary").div(1e6).round(3).to_csv(dest.parent / "lahman_avg_salary.csv")
