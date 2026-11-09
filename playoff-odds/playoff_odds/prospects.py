@@ -1,7 +1,8 @@
 """Prospect trade value from a scouting grade (Future Value, 20-80 scale).
 
-You choose the grade. The app turns it into surplus value with the same
-machinery used for major leaguers:
+Each prospect gets an estimated grade from historical comps (see "estimated
+grades" below), which the user can override. The grade becomes surplus value
+with the same machinery used for major leaguers:
 
 1. **Grade -> WAR if he pans out.** On the FanGraphs FV scale a 50 is an
    average regular (~2 WAR), 60 an all-star-level player (~4 WAR), and
@@ -18,8 +19,6 @@ machinery used for major leaguers:
    the comparable-player contract model (league minimum, then arbitration
    raises) and the same $/WAR, salary growth and 8% discount as everyone else.
 
-The stats shown next to each prospect are a reference for choosing a grade,
-not an input to the value.
 """
 
 from __future__ import annotations
@@ -117,3 +116,136 @@ def summarize_stats(milb: pd.DataFrame, player_id: int, age: float | None) -> di
         line += " (also " + ", ".join(use.level.iloc[1:].tolist()) + ")"
     avl = None if age is None else round(age - TYPICAL_AGE[lvl], 1)
     return {"level": lvl, "line": line, "age_vs_level": avl, "pitcher_stats": bool(is_p)}
+
+
+# ------------------------------------------------------------------ estimated grades
+#
+# A default grade estimated from stats, calibrated on history. For every
+# minor leaguer in 2015-2019 we know his level, his age relative to that level,
+# how he performed relative to the level, and how much MLB WAR he produced over
+# the next six seasons (``resources/prospect_comps.csv``). A current prospect's
+# expected WAR is the distance-weighted average of his 60 most similar
+# historical player-seasons, busts included. Grades are then handed out by
+# rank, in roughly the proportions scouting lists use across all of the minors.
+
+LEVEL_INDEX = {"AAA": 4, "AA": 3, "A+": 2, "A": 1, "Rk": 0}
+# How many prospects (across all of MiLB) typically carry each grade or better.
+GRADE_RANK_CUTOFFS = [(70, 4), (65, 15), (60, 45), (55, 120), (50, 330), (45, 900)]
+K_PROSPECT = 60
+
+
+def _age_july1(birth: str | None, season: int) -> float | None:
+    if not birth or pd.isna(birth):
+        return None
+    return (pd.Timestamp(f"{season}-07-01") - pd.Timestamp(birth)).days / 365.25
+
+
+def prospect_features(milb: pd.DataFrame, season: int) -> pd.DataFrame:
+    """One row per player: pitcher flag, volume, level, age vs level, performance vs level.
+
+    Every quantity is weighted across levels by playing time, so a brief
+    cameo at a higher level doesn't dominate. Age and performance are measured
+    against that season's actual averages at each level.
+    """
+    df = milb.copy()
+    df["age"] = [_age_july1(b, season) for b in df.birth_date]
+    df = df.dropna(subset=["age"])
+    hit = df[(df.group == "hitting") & (df.PA > 0)].copy()
+    pit = df[(df.group == "pitching") & (df.BF > 0)].copy()
+
+    singles = hit.H - hit["2B"] - hit["3B"] - hit.HR
+    hit["obp_n"] = hit.H + hit.BB + hit.HBP
+    hit["obp_d"] = hit.AB + hit.BB + hit.HBP + hit.SF
+    hit["tb"] = singles + 2 * hit["2B"] + 3 * hit["3B"] + 4 * hit.HR
+    lv = hit.groupby("level").apply(lambda g: pd.Series({
+        "ops": g.obp_n.sum() / g.obp_d.sum() + g.tb.sum() / max(g.AB.sum(), 1),
+        "age": np.average(g.age, weights=g.PA)}), include_groups=False)
+    hit["ops"] = hit.obp_n / hit.obp_d.clip(lower=1) + hit.tb / hit.AB.clip(lower=1)
+    hit["perf"] = (hit.ops - hit.level.map(lv.ops)) / 0.100
+    hit["age_rel"] = hit.age - hit.level.map(lv.age)
+    hit["vol"] = hit.PA
+
+    lp = pit.groupby("level").apply(lambda g: pd.Series({
+        "kbb": (g.SO.sum() - g.BB.sum()) / g.BF.sum(),
+        "age": np.average(g.age, weights=g.BF)}), include_groups=False)
+    pit["perf"] = ((pit.SO - pit.BB) / pit.BF - pit.level.map(lp.kbb)) / 0.050
+    pit["age_rel"] = pit.age - pit.level.map(lp.age)
+    pit["vol"] = pit.BF
+
+    def agg(g):
+        w = g.vol
+        return pd.Series({
+            "vol": w.sum(),
+            "level_score": np.average(g.level.map(LEVEL_INDEX), weights=w),
+            "age_rel": np.average(g.age_rel, weights=w),
+            # performance shrunk toward average for small samples
+            "perf": np.average(g.perf, weights=w) * w.sum() / (w.sum() + 200),
+            "age": np.average(g.age, weights=w),
+        })
+
+    h = hit.groupby("player_id").apply(agg, include_groups=False).assign(pitcher=0)
+    p = pit.groupby("player_id").apply(agg, include_groups=False).assign(pitcher=1)
+    both = pd.concat([h, p])
+    # two-way or position players who pitched an inning: keep the role with more volume
+    # (BF counts ~ PA, so the volumes compare directly)
+    both = both.sort_values("vol", ascending=False)
+    both = both[~both.index.duplicated(keep="first")]
+    info = df.groupby("player_id")[["name", "birth_date", "mlb_debut"]].first()
+    return both.join(info)
+
+
+def _prospect_pool(feat: pd.DataFrame, season: int) -> pd.DataFrame:
+    """Players still eligible as prospects: no MLB debut before this season."""
+    debut_year = pd.to_datetime(feat.mlb_debut, errors="coerce").dt.year
+    return feat[(debut_year.isna()) | (debut_year >= season)]
+
+
+_COMPS: pd.DataFrame | None = None
+
+
+def prospect_comps() -> pd.DataFrame:
+    global _COMPS
+    if _COMPS is None:
+        from .contracts import RES
+        _COMPS = pd.read_csv(RES / "prospect_comps.csv")
+    return _COMPS
+
+
+def expected_future_war(feat: pd.DataFrame, k: int = K_PROSPECT) -> pd.Series:
+    """Expected MLB WAR over the next six seasons, from historical comps."""
+    comps = prospect_comps()
+    out = pd.Series(0.0, index=feat.index)
+    scale = {"level_score": 0.6, "age_rel": 0.7, "perf": 0.6, "logvol": 0.8}
+    for pit_flag in (0, 1):
+        f = feat[feat.pitcher == pit_flag]
+        c = comps[comps.pitcher == pit_flag]
+        if len(f) == 0 or len(c) == 0:
+            continue
+        cx = np.column_stack([c.level_score / scale["level_score"], c.age_rel / scale["age_rel"],
+                              c.perf / scale["perf"], np.log1p(c.vol) / scale["logvol"]])
+        fx = np.column_stack([f.level_score / scale["level_score"], f.age_rel / scale["age_rel"],
+                              f.perf / scale["perf"], np.log1p(f.vol) / scale["logvol"]])
+        fw = c.future_war.to_numpy()
+        vals = np.empty(len(f))
+        for i0 in range(0, len(f), 500):
+            dist = np.sqrt(((fx[i0:i0 + 500, None, :] - cx[None, :, :]) ** 2).sum(axis=2))
+            idx = np.argpartition(dist, k, axis=1)[:, :k]
+            dk = np.take_along_axis(dist, idx, axis=1)
+            w = 1.0 / (dk + 0.25)
+            vals[i0:i0 + 500] = (fw[idx] * w).sum(axis=1) / w.sum(axis=1)
+        out.loc[f.index] = vals
+    return out
+
+
+def estimate_grades(milb: pd.DataFrame, season: int) -> pd.DataFrame:
+    """Estimated FV grade and expected WAR for every eligible minor leaguer."""
+    feat = _prospect_pool(prospect_features(milb, season), season)
+    feat = feat[feat.vol >= 30]
+    feat["exp_war"] = expected_future_war(feat)
+    feat = feat.sort_values("exp_war", ascending=False)
+    feat["rank"] = np.arange(1, len(feat) + 1)
+    grade = np.full(len(feat), 40)
+    for g, cutoff in reversed(GRADE_RANK_CUTOFFS):
+        grade[feat["rank"].to_numpy() <= cutoff] = g
+    feat["est_grade"] = grade
+    return feat

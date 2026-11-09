@@ -68,7 +68,14 @@ A team **rejects** the trade if its net loss is bigger than the tolerance (defau
 
 Turn on **Include prospects** to add each organization's minor leaguers: everyone off the 40-man roster who belonged to the club on the chosen date. They're sorted by highest level, then youngest for that level, and each shows his stat line at his highest level this season.
 
-For each prospect you choose a **Future Value grade** (FanGraphs-style 20–80 scale) and an ETA (seasons until he reaches the majors). The stats are only a reference. The app turns the grade into surplus value with the same tools used for major leaguers:
+Each prospect gets an **estimated Future Value grade** (FanGraphs-style 20–80 scale), which you can override:
+
+- He's matched with the **60 most similar minor-league seasons from 2015–2019** (about 34,000 seasons). Similarity is based on level, age relative to the level's real average age, performance relative to the level (OPS for hitters, K−BB% for pitchers), and playing time. Every measure is weighted across levels by playing time, so a short cameo at a higher level doesn't dominate.
+- His **expected MLB WAR** is what those comps produced over the next six seasons, busts included.
+- Grades follow his rank among all eligible minor leaguers (no MLB debut before this season), in roughly the proportions scouting lists use: #1–4 → 70, through #15 → 65, #45 → 60, #120 → 55, #330 → 50, #900 → 45, and 40 after that.
+- **Holdout check:** using only 2015–2017 comps, the top picks for 2018 were Vlad Jr., Eloy Jiménez, Kyle Tucker, Tatis, Yordan Alvarez, Soto, and Bichette. For 2019 they were Wander Franco, Luis Robert, Julio Rodríguez, and Gavin Lux. The top 50 averaged 7.0 MLB WAR over six years, versus 0.24 for all minor leaguers. It's stats only, with no scouting, injuries, or makeup, so override it when you know better.
+
+The grade then becomes surplus value:
 
 - **WAR if he reaches his grade:** 50 ≈ 2 WAR (average regular), 60 ≈ 4 (all-star level), 70 ≈ 6 (superstar).
 - **Bust risk:** each grade gets a realization factor. Pitchers carry 25% more risk, and each year of ETA beyond one adds 8%.
@@ -101,9 +108,9 @@ playoff_odds/simulate.py  Season simulator + tiebreakers
 playoff_odds/trade.py     Trade deltas per model, before/after runs
 playoff_odds/value.py     Surplus value and accept/reject verdicts
 playoff_odds/contracts.py Contract predictions from historical comps
-playoff_odds/prospects.py Prospect value from FV grades, minor-league stat lines
+playoff_odds/prospects.py Prospect grades (historical comps) and grade-to-value model
 playoff_odds/resources/   Comps table + league-average salary series
-scripts/                  One-time build script for the comps table
+scripts/                  One-time build scripts for the contract and prospect comps tables
 tests/                    Integration tests against real seasons
 ```
 

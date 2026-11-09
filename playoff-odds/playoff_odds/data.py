@@ -359,12 +359,15 @@ def milb_stats_to_date(season: int, as_of: date) -> pd.DataFrame:
             offset = 0
             while True:
                 d = _get("stats", {**base, "group": group, "playerPool": "ALL", "limit": 2000,
-                                   "offset": offset}, ttl_days=ttl)
+                                   "offset": offset, "hydrate": "person"}, ttl_days=ttl)
                 s = d["stats"][0] if d.get("stats") else {"splits": []}
                 for sp in s["splits"]:
                     st = sp["stat"]
                     rows.append({
-                        "player_id": sp["player"]["id"], "level": level, "sport": sport, "group": group,
+                        "player_id": sp["player"]["id"], "name": sp["player"].get("fullName"),
+                        "birth_date": sp["player"].get("birthDate"),
+                        "mlb_debut": sp["player"].get("mlbDebutDate"),
+                        "level": level, "sport": sport, "group": group,
                         "PA": int(st.get("plateAppearances", 0) or 0), "AB": int(st.get("atBats", 0) or 0),
                         "H": int(st.get("hits", 0) or 0), "2B": int(st.get("doubles", 0) or 0),
                         "3B": int(st.get("triples", 0) or 0), "HR": int(st.get("homeRuns", 0) or 0),
@@ -380,4 +383,6 @@ def milb_stats_to_date(season: int, as_of: date) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     keys = ["player_id", "level", "sport", "group"]
-    return df.groupby(keys, as_index=False).sum(numeric_only=True)
+    info = df.groupby("player_id")[["name", "birth_date", "mlb_debut"]].first()
+    out = df.groupby(keys, as_index=False).sum(numeric_only=True)
+    return out.merge(info, left_on="player_id", right_index=True, how="left")

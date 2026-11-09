@@ -60,6 +60,11 @@ def milb_stats(season: int, as_of: date):
     return data.milb_stats_to_date(season, as_of)
 
 
+@st.cache_data(show_spinner="Estimating prospect grades from historical comps…")
+def prospect_estimates(season: int, as_of: date) -> pd.DataFrame:
+    return prospects.estimate_grades(milb_stats(season, as_of), season)
+
+
 @st.cache_data(show_spinner="Simulating seasons…", max_entries=64)
 def simulate_cached(season, as_of, moves_json, models, sims, seed):
     ctx = get_ctx(season, as_of)
@@ -288,25 +293,42 @@ if include_prospects:
     milb = milb_stats(season, as_of)
     p_info: dict[int, dict] = {}
 
+    est = prospect_estimates(season, as_of)
+
     def prospect_labels(team_id, forty_ids):
         lst = org_prospects(team_id, as_of, tuple(sorted(forty_ids)))
         lab, rows = {}, []
         for pr in lst:
             age = players._age_on(pr.birth_date, as_of)
             sm = prospects.summarize_stats(milb, pr.player_id, age)
-            p_info[pr.player_id] = {"name": pr.name, "pos": pr.pos, "age": age, **sm, "org": team_id}
-            rank = prospects.LEVEL_ORDER.index(sm["level"]) if sm["level"] else 9
-            rows.append((rank, sm["age_vs_level"] if sm["age_vs_level"] is not None else 9, pr.player_id))
-        for _, _, pid in sorted(rows):
+            e = est.loc[pr.player_id] if pr.player_id in est.index else None
+            grade = int(e.est_grade) if e is not None else 40
+            rank = int(e["rank"]) if e is not None else None
+            p_info[pr.player_id] = {"name": pr.name, "pos": pr.pos, "age": age, **sm, "org": team_id,
+                                    "est_grade": grade, "est_rank": rank,
+                                    "exp_war": float(e.exp_war) if e is not None else 0.0}
+            rows.append((rank if rank is not None else 10**6, pr.player_id))
+        for _, pid in sorted(rows):
             i = p_info[pid]
             agetxt = f"{i['age']:.0f}" if i["age"] is not None else "?"
-            lab[pid] = f"{i['name']} ({i['pos']}, {agetxt}) · {i['line']}"
+            eta = prospects.DEFAULT_ETA.get(i["level"], 3)
+            pv = prospects.prospect_value(i["est_grade"], eta, i["pitcher_stats"] or i["pos"] == "P",
+                                          i["age"], season, growth).surplus
+            rk = f"#{i['est_rank']}, " if i["est_rank"] else ""
+            lab[pid] = (f"{i['name']} ({i['pos']}, {agetxt}) · est. FV {i['est_grade']} ({rk}{money(pv)}) · "
+                        f"{i['line']}")
         return lab
 
     plab_a = prospect_labels(team_a, set(lab_a))
     plab_b = prospect_labels(team_b, set(lab_b))
-    st.caption("Sorted by highest level, then youngest for that level. Being young for a level is a "
-               "classic sign of a good prospect.")
+    st.caption(
+        "Sorted by **estimated grade**. Each prospect is matched with the 60 most similar minor-league seasons "
+        "from 2015–2019, by level, age relative to the level, performance relative to the level, and playing "
+        "time. His expected MLB WAR is what those players produced over the next six years, busts included. "
+        "Grades follow his rank among all eligible minor leaguers (#1–4 → 70, through #15 → 65, #45 → 60, "
+        "#120 → 55, #330 → 50, #900 → 45). It's a stats-only estimate: no scouting, injuries or makeup. "
+        "Override the grade below when you know better."
+    )
     c1, c2 = st.columns(2)
     with c1:
         pros_a = st.multiselect(f"{teams.loc[team_a, 'short']} prospects sent", list(plab_a),
@@ -318,8 +340,8 @@ if include_prospects:
     if pros_a or pros_b:
         st.subheader("Prospects in the deal")
         st.caption(
-            "Choose a **Future Value grade** (20–80 scouting scale) for each prospect. The stats are only a "
-            "reference. ETA is the number of seasons until he's expected to reach the majors. Value accounts "
+            "Each prospect starts at his **estimated Future Value grade** (20–80 scouting scale). Change it if "
+            "you disagree, for example to match a published prospect ranking. ETA is the number of seasons until he's expected to reach the majors. Value accounts "
             "for bust risk (higher for pitchers and for prospects further away), six years of team control, "
             "and predicted pre-arbitration and arbitration salaries. Prospects don't change this season's "
             "playoff odds."
@@ -331,7 +353,7 @@ if include_prospects:
             pitcher = i["pitcher_stats"] or i["pos"] == "P"
             prow.append({
                 "pid": pid, "Prospect": i["name"],
-                "Grade": prospects.GRADE_LABELS[45],
+                "Grade": prospects.GRADE_LABELS[i["est_grade"]],
                 "ETA (yrs)": prospects.DEFAULT_ETA.get(i["level"], 3),
                 "Type": "Pitcher" if pitcher else "Hitter",
                 "Pos": i["pos"],
@@ -758,7 +780,9 @@ season's league-average salary, then rescaled to the league average for each fut
 with the salary-growth setting. Each team's net is value received − value sent + a contender premium (change in playoff odds ×
 the value of a playoff spot). A team rejects if its net loss is bigger than the tolerance you set in the sidebar.
 
-**Prospects.** You choose a Future Value grade and an ETA. The grade sets the WAR he'd produce if he
+**Prospects.** Each prospect's default grade is estimated from his 60 most similar minor-league seasons
+from 2015–2019 (level, age vs level, performance vs level, playing time). His expected MLB WAR over six years
+sets his rank, and the rank sets the grade. You can override the grade and the ETA. The grade sets the WAR he'd produce if he
 pans out (50 ≈ 2, 60 ≈ 4, 70 ≈ 6). A bust-risk factor (higher for pitchers and for prospects further
 away) scales that down. Six years of control at predicted pre-arb and arbitration salaries give the surplus
 value, discounted from his debut. Prospects affect trade value only, not this season's odds.
