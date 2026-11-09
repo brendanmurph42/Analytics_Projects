@@ -60,6 +60,7 @@ class LeagueContext:
     runs_per_win: float
     hit_repl_per_pa: float  # replacement runs added per PA
     pit_repl_scale: float   # multiplier on role-based replacement runs per IP
+    lg_r_per_pa: float = 0.118  # league runs per plate appearance
 
 
 # --------------------------------------------------------------- helpers
@@ -132,8 +133,9 @@ def build_context(season: int, hit: pd.DataFrame, pit: pd.DataFrame) -> LeagueCo
     base_repl = ((_repl_ra9_mult(_sp_share(pit)) - 1) * lg_ra9 * ip / 9).sum()
     pit_repl_scale = ((1 - HIT_SHARE) * target_runs - pit_raa) / base_repl
 
+    lg_r_per_pa = pit["R"].sum() / max(pit["BF"].sum(), 1)
     return LeagueContext(season, lg_woba, lg_wsb_rate, lg_ra9, fip_const, rpw,
-                         hit_repl_per_pa, pit_repl_scale)
+                         hit_repl_per_pa, pit_repl_scale, lg_r_per_pa)
 
 
 def _hitter_values(h: pd.DataFrame, ctx: LeagueContext) -> pd.DataFrame:
@@ -298,3 +300,55 @@ def player_rates(pv: PlayerValues, hp: pd.DataFrame, pp: pd.DataFrame, player_id
             "proj_pit_per_ip": proj_pit,
         })
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------- custom players
+
+# Full-season playing time used to express a "WAR pace" and as default usage.
+CUSTOM_PACE = {"Hitter": 650.0, "SP": 180.0, "RP": 65.0}
+CUSTOM_PER_GAME = {"Hitter": 4.2, "SP": 1.1, "RP": 0.4}
+ERA_TO_RA9 = 1.08  # runs allowed run ~8% higher than earned runs
+
+
+def custom_player_rates(spec: dict, ctx: LeagueContext) -> dict:
+    """Rates for a user-defined player, in the same shape as ``player_rates`` rows.
+
+    ``spec`` keys: name, kind ("Hitter" | "Pitcher"), pos (hitters),
+    role ("SP" | "RP", pitchers), mode ("WAR pace" | "Rate stat"), value.
+      * Hitter, WAR pace:  WAR per 650 PA.
+      * Hitter, Rate stat: wRC+ (100 = league average bat).
+      * Pitcher, WAR pace: WAR per 180 IP (SP) or 65 IP (RP).
+      * Pitcher, Rate stat: FIP (or ERA) on the ERA scale.
+    A custom player is treated as a known talent level, so the to-date and
+    projection rates are the same.
+    """
+    off = def_ = pit = 0.0
+    pa_g = ip_g = 0.0
+    value = float(spec["value"])
+    if spec["kind"] == "Hitter":
+        pos = spec.get("pos") or "DH"
+        def_ = POS_ADJ.get(pos, 0.0) / FULL_SEASON_PA
+        if spec["mode"] == "WAR pace":
+            off = value * ctx.runs_per_win / CUSTOM_PACE["Hitter"] - def_
+        else:
+            off = (value / 100.0 - 1.0) * ctx.lg_r_per_pa + ctx.hit_repl_per_pa
+        pa_g = CUSTOM_PER_GAME["Hitter"]
+    else:
+        role = spec.get("role") or "SP"
+        pos = "P"
+        if spec["mode"] == "WAR pace":
+            pit = value * ctx.runs_per_win / CUSTOM_PACE[role]
+        else:
+            sp_share = 1.0 if role == "SP" else 0.0
+            repl = (_repl_ra9_mult(sp_share) - 1) * ctx.lg_ra9 / 9 * ctx.pit_repl_scale
+            pit = (ctx.lg_ra9 - value * ERA_TO_RA9) / 9 + repl
+        ip_g = CUSTOM_PER_GAME[role]
+    pace = CUSTOM_PACE["Hitter"] if spec["kind"] == "Hitter" else CUSTOM_PACE[spec.get("role") or "SP"]
+    war_pace = ((off + def_) * pace if spec["kind"] == "Hitter" else pit * pace) / ctx.runs_per_win
+    return {
+        "name": spec["name"], "pos": pos, "PA": 0.0, "IP": 0.0, "war_todate": float("nan"),
+        "war_pace": war_pace,
+        "rem_pa_per_g": pa_g, "rem_ip_per_g": ip_g,
+        "todate_off_per_pa": off, "def_per_pa": def_, "todate_pit_per_ip": pit,
+        "proj_off_per_pa": off, "proj_pit_per_ip": pit,
+    }

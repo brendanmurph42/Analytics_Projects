@@ -16,8 +16,9 @@ Data comes from the free MLB Stats API and is cached in `.cache/`. The first loa
 
 1. In the sidebar, pick a season and an as-of date. Games on or before that date count as played, and every later game is simulated.
 2. Pick Team A and Team B, then the players each side sends. Rosters reflect who was in each organization on that date, including injured-list players.
-3. Adjust **Remaining PA / IP** for each player if you expect a different role or an injury.
-4. Read the before/after odds: make playoffs, win division, first-round bye, projected wins, the seed distribution, and the league-wide ripple effects.
+3. Optionally add **custom players**: free agents, prospects, or hypothetical players that you describe by talent level instead of looking up. Choose which team each one joins, and whether they come from outside the deal or from the other team.
+4. Adjust **Remaining PA / IP** for each player if you expect a different role or an injury.
+5. Read the before/after odds: make playoffs, win division, first-round bye, projected wins, the seed distribution, and the league-wide ripple effects.
 
 ## The three models
 
@@ -28,6 +29,17 @@ Data comes from the free MLB Stats API and is cached in `.cache/`. The first loa
 | **Run differential** | Season-to-date runs, split into offense and run prevention | Moves team runs scored / allowed, then win% via Pythagenpat (diminishing returns) |
 
 The headline number is the average of whichever models you select.
+
+## Custom players
+
+You don't need a player to exist in MLB's data. Open **Custom players** and describe one by either:
+
+- **WAR pace**: WAR per 650 PA for hitters, or per 180 IP (starters) / 65 IP (relievers) for pitchers. 2 is average, 5 is all-star, and 8+ is MVP-level.
+- **Rate stat**: wRC+ for hitters (100 = league average, plus a position), or FIP / ERA for pitchers.
+
+The app converts that to runs per PA or IP using the selected season's league constants. Custom players default to everyday-hitter, rotation-starter, or regular-reliever playing time, which you can edit. The list lasts for your browser session. Use **Download list** to save it as JSON, and upload that file next time.
+
+Real players don't need manual updates either. Stats and rosters come live from the MLB Stats API for whatever date you pick.
 
 ## Simulation details
 

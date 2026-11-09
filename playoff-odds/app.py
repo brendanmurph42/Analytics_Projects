@@ -116,20 +116,130 @@ with c2:
     send_b = st.multiselect(f"{teams.loc[team_b, 'short']} send", list(lab_b), format_func=lab_b.get,
                             placeholder="Players leaving Team B")
 
+# ------------------------------------------------------------------ custom players
+
+if "custom_players" not in st.session_state:
+    st.session_state.custom_players = []
+library: list[dict] = st.session_state.custom_players
+abbr_a, abbr_b = teams.loc[team_a, "abbr"], teams.loc[team_b, "abbr"]
+HITTER_POS = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"]
+
+
+def custom_label(spec: dict) -> str:
+    if spec["kind"] == "Hitter":
+        what = f"{spec['pos']}, " + (f"{spec['value']:.1f} WAR/650 PA" if spec["mode"] == "WAR pace"
+                                     else f"{spec['value']:.0f} wRC+")
+    else:
+        what = f"{spec['role']}, " + (f"{spec['value']:.1f} WAR/{'180' if spec['role'] == 'SP' else '65'} IP"
+                                      if spec["mode"] == "WAR pace" else f"{spec['value']:.2f} FIP")
+    return f"{spec['name']} ({what})"
+
+
+with st.expander("➕ Custom players: free agents, call-ups, or anyone you want to make up"):
+    st.caption(
+        "Describe a player by talent level instead of looking him up. Custom players are kept for this "
+        "browser session. Download the list to keep it, and upload it next time."
+    )
+    with st.form("new_custom", clear_on_submit=True):
+        f1, f2, f3 = st.columns([2, 1, 1])
+        cname = f1.text_input("Name", placeholder="e.g. Top prospect call-up")
+        ckind = f2.radio("Type", ["Hitter", "Pitcher"], horizontal=True)
+        cmode = f3.radio("Describe by", ["WAR pace", "Rate stat"], horizontal=True,
+                         help="WAR pace: WAR per 650 PA (hitters) or per 180 IP / 65 IP (starters / relievers). "
+                              "Rate stat: wRC+ for hitters, FIP or ERA for pitchers.")
+        g1, g2, g3 = st.columns(3)
+        cpos = g1.selectbox("Position (hitters)", HITTER_POS, index=HITTER_POS.index("CF"))
+        crole = g2.selectbox("Role (pitchers)", ["SP", "RP"])
+        cvalue = g3.number_input(
+            "Value", value=3.0, step=0.1, format="%.2f",
+            help="WAR pace: 2 is average, 5 is all-star, 8+ is MVP-level. wRC+: 100 is average. "
+                 "FIP: about 4.10 is average.",
+        )
+        if st.form_submit_button("Add player", type="primary"):
+            nm = cname.strip() or f"Custom {ckind.lower()} {len(library) + 1}"
+            if cmode == "Rate stat" and ckind == "Hitter" and cvalue < 10:
+                st.error("For hitters, the rate stat is wRC+ (e.g. 120), not WAR.")
+            elif cmode == "Rate stat" and ckind == "Pitcher" and not 0.5 <= cvalue <= 9:
+                st.error("For pitchers, the rate stat is FIP or ERA (e.g. 3.25).")
+            else:
+                library.append({"id": -(max([-x["id"] for x in library], default=0) + 1), "name": nm,
+                                "kind": ckind, "pos": cpos if ckind == "Hitter" else "P",
+                                "role": crole if ckind == "Pitcher" else None,
+                                "mode": cmode, "value": float(cvalue)})
+                st.rerun()
+
+    if library:
+        st.dataframe(pd.DataFrame([{"Player": custom_label(x),
+                                    "WAR / full season": players.custom_player_rates(x, ctx.pv.ctx)["war_pace"]}
+                                   for x in library]).style.format({"WAR / full season": "{:.1f}"}),
+                     hide_index=True, width="stretch")
+    d1, d2, d3 = st.columns([1, 1, 2])
+    d1.download_button("Download list", data=pd.Series(library).to_json(orient="values"),
+                       file_name="custom_players.json", mime="application/json", disabled=not library)
+    if d2.button("Clear list", disabled=not library):
+        st.session_state.custom_players = []
+        st.rerun()
+    up = d3.file_uploader("Upload a saved list", type="json", label_visibility="collapsed")
+    if up is not None and st.session_state.get("_last_upload") != up.file_id:
+        import json
+        try:
+            loaded = json.loads(up.getvalue())
+            have = {(x["name"], x["kind"], x["value"]) for x in library}
+            for x in loaded:
+                if (x["name"], x["kind"], x["value"]) not in have:
+                    x["id"] = -(max([-y["id"] for y in library], default=0) + 1)
+                    library.append(x)
+            st.session_state._last_upload = up.file_id
+            st.rerun()
+        except (ValueError, KeyError, TypeError):
+            st.error("That file isn't a custom player list from this app.")
+
+custom_in = []
+if library:
+    by_id = {x["id"]: x for x in library}
+    c1, c2 = st.columns(2)
+    with c1:
+        join_a = st.multiselect(f"Custom players joining {teams.loc[team_a, 'short']}", list(by_id),
+                                format_func=lambda i: custom_label(by_id[i]), placeholder="None")
+    with c2:
+        join_b = st.multiselect(f"Custom players joining {teams.loc[team_b, 'short']}",
+                                [i for i in by_id if i not in join_a],
+                                format_func=lambda i: custom_label(by_id[i]), placeholder="None")
+    source = st.radio(
+        "Custom players come from", ["Outside the deal (free agent, minors)", "The other team in the deal"],
+        horizontal=True,
+        help="'The other team' also removes the player from that club, as in a normal trade.",
+    )
+    from_other = source.startswith("The other")
+    for i in join_a:
+        custom_in.append((by_id[i], team_a, team_b if from_other else None))
+    for i in join_b:
+        custom_in.append((by_id[i], team_b, team_a if from_other else None))
+
 moves = None
-if send_a or send_b:
+if send_a or send_b or custom_in:
     positions = {**pos_a, **pos_b}
-    rates = players.player_rates(ctx.pv, ctx.hp, ctx.pp, send_a + send_b, as_of, positions)
-    rates["from"] = [teams.loc[team_a if p in send_a else team_b, "abbr"] for p in rates.player_id]
-    rates["to"] = [teams.loc[team_b if p in send_a else team_a, "abbr"] for p in rates.player_id]
-    rates["to_id"] = [team_b if p in send_a else team_a for p in rates.player_id]
+    real = players.player_rates(ctx.pv, ctx.hp, ctx.pp, send_a + send_b, as_of, positions) \
+        if (send_a or send_b) else pd.DataFrame()
+    if len(real):
+        real["to_id"] = [team_b if p in send_a else team_a for p in real.player_id]
+        real["from_id"] = [team_a if p in send_a else team_b for p in real.player_id]
+    custom_rows = []
+    for spec, to_id, from_id in custom_in:
+        row = players.custom_player_rates(spec, ctx.pv.ctx)
+        row.update(player_id=spec["id"], to_id=to_id, from_id=from_id)
+        custom_rows.append(row)
+    rates = pd.concat([real, pd.DataFrame(custom_rows)], ignore_index=True)
+    rates["from"] = [teams.loc[f, "abbr"] if pd.notna(f) else "Outside" for f in rates.from_id]
+    rates["to"] = [teams.loc[t, "abbr"] for t in rates.to_id]
     rates["rem_pa"] = (rates.rem_pa_per_g * rates.to_id.map(ctx.rem_games)).round(0)
     rates["rem_ip"] = (rates.rem_ip_per_g * rates.to_id.map(ctx.rem_games)).round(1)
 
     st.subheader("Players in the deal")
     st.caption(
-        "Remaining PA and IP default to each player's season-to-date rate per team game. "
-        "Edit them for injuries, role changes, or a hitter you expect to play every day."
+        "Remaining PA and IP default to each player's season-to-date rate per team game. Custom players "
+        "default to everyday hitter, rotation starter, or regular reliever usage. Edit them for injuries, "
+        "role changes, or a hitter you expect to play every day."
     )
     edit = st.data_editor(
         rates[["name", "pos", "from", "to", "PA", "IP", "war_todate", "rem_pa", "rem_ip"]],
@@ -158,13 +268,16 @@ if send_a or send_b:
     with st.expander("Rest-of-season value by model", expanded=False):
         st.dataframe(show.style.format({c: "{:+.2f}" for c in show.columns[1:]}),
                      hide_index=True, width="stretch")
-        st.caption("WAR columns are wins above replacement over the remaining games; run-diff columns are runs.")
+        st.caption("WAR columns are wins above replacement over the remaining games; run-diff columns are runs. "
+                   "Custom players have the same value in every model.")
 
     arrive = rates.assign(team_id=rates.to_id, sign=1)
-    depart = rates.assign(team_id=[teams.index[teams.abbr == f][0] for f in rates["from"]], sign=-1)
+    depart = rates[rates.from_id.notna()].assign(sign=-1)
+    depart["team_id"] = depart.from_id.astype(int)
     moves = pd.concat([arrive, depart], ignore_index=True)[
         ["team_id", "sign", "rem_pa", "rem_ip", "todate_off_per_pa", "def_per_pa",
          "todate_pit_per_ip", "proj_off_per_pa", "proj_pit_per_ip"]]
+    moves["team_id"] = moves.team_id.astype(int)
 
 # ------------------------------------------------------------------ simulate
 
@@ -313,6 +426,11 @@ Runs per win this season: **{c.runs_per_win:.2f}**.
 
 **Trade logic.** A departing player's playing time is filled at replacement level, and an arriving
 player's time displaces replacement level. This is why the remaining PA and IP you enter matter.
+
+**Custom players.** You describe a custom player's talent directly, as a WAR pace (per 650 PA, or per
+180 IP for starters and 65 IP for relievers) or as a rate stat (wRC+ for hitters, FIP or ERA for pitchers).
+The app converts that to runs per PA or per IP with this season's league constants. The same value is used
+in all three models, since there's no track record for them to disagree about.
 
 **Not modeled.** Park factors, fielding metrics beyond the positional adjustment, reliever leverage,
 injuries after the as-of date (edit playing time instead), and postseason series odds.
