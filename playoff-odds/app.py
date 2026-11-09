@@ -1,12 +1,12 @@
-"""Streamlit app: playoff odds on any date, before and after a trade.
+"""Streamlit app: odds of making the next playoffs as of any date, before and after a move.
 
 Run with:  streamlit run app.py
 """
 
 from __future__ import annotations
 
-from datetime import date
-from io import StringIO
+import json
+from datetime import date, timedelta
 
 import altair as alt
 import numpy as np
@@ -15,39 +15,46 @@ import streamlit as st
 
 from playoff_odds import contracts, data, players, prospects, trade, value
 
-st.set_page_config(page_title="Trade Playoff Odds", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="Playoff Odds", page_icon="⚾", layout="wide")
+RATE_COLS = trade.RATE_COLS
 
 
 # ------------------------------------------------------------------ caching
 
-@st.cache_resource(show_spinner="Loading season data…")
-def get_ctx(season: int, as_of: date) -> trade.Context:
-    return trade.load_context(season, as_of)
-
-
-@st.cache_data(show_spinner=False)
-def season_bounds(season: int):
-    s = data.get_schedule(season)
-    return s.date.min().date(), s.date.max().date()
-
-
-@st.cache_data(show_spinner=False)
-def roster(team_id: int, as_of: date):
-    return data.get_roster(team_id, as_of)
+@st.cache_resource(show_spinner="Loading rosters, projections and schedule…", max_entries=8)
+def get_ctx(as_of: date) -> trade.Context:
+    return trade.load_context(as_of)
 
 
 @st.cache_data(show_spinner="Estimating contracts and surplus values…")
-def roster_surplus(season: int, as_of: date, team_id: int, growth: float) -> dict[int, float]:
+def roster_surplus(as_of: date, team_id: int, growth: float) -> dict[int, float]:
     """Default surplus value ($M) for everyone on a roster, for the dropdown labels."""
-    ctx = get_ctx(season, as_of)
-    r = data.get_roster(team_id, as_of)
-    if not r:
+    ctx = get_ctx(as_of)
+    r = ctx.rates[ctx.rates.team_id == team_id].copy()
+    if not len(r):
         return {}
-    rates = players.player_rates(ctx.pv, ctx.hp, ctx.pp, [p.player_id for p in r], as_of,
-                                 {p.player_id: p.pos for p in r})
-    rates["to_id"] = team_id
-    d = trade.player_value_defaults(ctx, rates, growth)
-    return {int(pid): x["surplus"] for pid, x in zip(rates.player_id, d)}
+    r["to_id"] = team_id
+    d = trade.player_value_defaults(ctx, r, growth)
+    return {int(pid): x["surplus"] for pid, x in zip(r.player_id, d)}
+
+
+@st.cache_data(show_spinner="Projecting free agents…")
+def free_agent_table(as_of: date, growth: float) -> pd.DataFrame:
+    """Free agents who played in the majors recently, with projections and predicted contracts."""
+    ctx = get_ctx(as_of)
+    recent = set(ctx.pv.table.index) | set(ctx.hp.index[ctx.hp.wpa > 0]) | set(ctx.pp.index[ctx.pp.wip > 0])
+    fas = [f for f in ctx.free_agents if f.player_id in recent]
+    if not fas:
+        return pd.DataFrame()
+    r = players.player_rates(ctx.pv, ctx.hp, ctx.pp, [f.player_id for f in fas], ctx.as_of,
+                             {f.player_id: f.pos for f in fas})
+    r["last_team"] = [f.last_team for f in fas]
+    r["to_id"] = ctx.teams.team_id.iloc[0]   # placeholder; value doesn't depend on the club here
+    d = trade.player_value_defaults(ctx, r, growth)
+    r["war_season"] = [x["war_season"] for x in d]
+    r["fa_salary"] = [x["salary"] for x in d]
+    r["fa_years"] = [x["control"] + 1 for x in d]
+    return r.sort_values("war_season", ascending=False).set_index("player_id", drop=False)
 
 
 @st.cache_data(show_spinner="Loading minor-league rosters…")
@@ -66,10 +73,10 @@ def prospect_estimates(season: int, as_of: date) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Simulating seasons…", max_entries=64)
-def simulate_cached(season, as_of, moves_json, models, sims, seed):
-    ctx = get_ctx(season, as_of)
-    moves = pd.read_json(StringIO(moves_json)) if moves_json else None
-    deltas = trade.trade_runs(moves, ctx.rem_games) if moves is not None and len(moves) else None
+def simulate_cached(as_of, moves_json, models, sims, seed):
+    ctx = get_ctx(as_of)
+    moves = json.loads(moves_json) if moves_json else []
+    deltas = trade.trade_effect(ctx, moves)[0] if moves else None
     res = trade.run_models(ctx, deltas, list(models), sims, seed)
     return {k: v.__dict__ for k, v in res.items()}, (deltas.to_dict() if deltas is not None else None)
 
@@ -77,12 +84,11 @@ def simulate_cached(season, as_of, moves_json, models, sims, seed):
 # ------------------------------------------------------------------ sidebar
 
 st.sidebar.title("⚾ Settings")
-season = st.sidebar.selectbox("Season", data.SUPPORTED_SEASONS[::-1], index=1)
-lo, hi = season_bounds(season)
-default_day = min(max(date(season, 7, 31), lo), hi)
+today = date.today()
 as_of = st.sidebar.date_input(
-    "Odds as of (end of day)", value=default_day, min_value=lo, max_value=hi,
-    help="Games on or before this date count as played. Every later game is simulated.",
+    "Odds as of (end of day)", value=today, min_value=date(data.FIRST_SEASON, 3, 1), max_value=today,
+    help="Odds are for the next playoffs after this date: this season's until its regular season ends, "
+         "then next season's. Games through this date count as played, and everything after is simulated.",
 )
 model_keys = st.sidebar.multiselect(
     "Models", list(trade.MODELS), default=list(trade.MODELS), format_func=trade.MODELS.get,
@@ -108,37 +114,56 @@ growth_pct = st.sidebar.number_input(
 )
 growth = growth_pct / 100
 st.sidebar.caption(
-    "The same random draws are used before and after the trade, so the "
-    "difference reflects the trade rather than simulation noise."
+    "The same random draws are used before and after a move, so the "
+    "difference reflects the move rather than simulation noise."
 )
 
 if not model_keys:
     st.warning("Pick at least one model.")
     st.stop()
 
-ctx = get_ctx(season, as_of)
+ctx = get_ctx(as_of)
+season = ctx.season
 teams = ctx.teams.set_index("team_id")
 idx = ctx.idx
+rem_frac = ctx.rem_frac
+offseason = not ctx.in_season
 
-st.title("Trade Playoff Odds")
-st.caption(
-    f"{season} season · odds as of end of {as_of:%b %d, %Y} · "
-    f"{len(ctx.setup.rem_home):,} games left to simulate"
-)
+st.title(f"{season} Playoff Odds")
+if offseason:
+    phase = "spring training" if as_of.year == season else "offseason"
+    st.caption(
+        f"As of the end of {as_of:%b %d, %Y} ({phase}). The full {season} season "
+        f"({len(ctx.setup.rem_home):,} games, starting {ctx.season_start:%b %d}) is projected from each club's "
+        "current roster, blended with last season's results."
+    )
+else:
+    st.caption(f"As of the end of {as_of:%b %d, %Y} · {len(ctx.setup.rem_home):,} games left to simulate "
+               f"in the {season} regular season (ends {ctx.season_end:%b %d}).")
+if season >= 2027:
+    st.info("MLB's labor agreement expired December 1, 2026. These odds assume the 2027 season keeps the "
+            "current schedule and 12-team playoff format.", icon="ℹ️")
 
 # ------------------------------------------------------------------ trade builder
 
 team_opts = ctx.teams.sort_values("name").team_id.tolist()
-name_of = lambda t: f"{teams.loc[t, 'name']} ({ctx.base.loc[t, 'W']}-{ctx.base.loc[t, 'L']})"
+
+
+def name_of(t):
+    if offseason:
+        w = round(ctx.base.loc[t, "wp_proj"] * 162)
+        return f"{teams.loc[t, 'name']} (proj. {w}-{162 - w})"
+    return f"{teams.loc[t, 'name']} ({ctx.base.loc[t, 'W']}-{ctx.base.loc[t, 'L']})"
+
 
 c1, c2 = st.columns(2)
 with c1:
     team_a = st.selectbox("Team A", team_opts, format_func=name_of,
-                          index=team_opts.index(121) if 121 in team_opts else 0)
+                          index=team_opts.index(111) if 111 in team_opts else 0)
 with c2:
     opts_b = [t for t in team_opts if t != team_a]
     team_b = st.selectbox("Team B", opts_b, format_func=name_of,
-                          index=opts_b.index(116) if 116 in opts_b else 0)
+                          index=opts_b.index(158) if 158 in opts_b else 0)
 
 
 def money(m: float) -> str:
@@ -149,16 +174,17 @@ def money(m: float) -> str:
 
 
 def roster_labels(team_id):
-    r = roster(team_id, as_of)
+    r = ctx.rates[ctx.rates.team_id == team_id]
     tbl = ctx.pv.table
-    sv = roster_surplus(season, as_of, team_id, round(growth, 4))
+    sv = roster_surplus(as_of, team_id, round(growth, 4))
+    war = {pid: (tbl.loc[pid, "war_todate"] if pid in tbl.index else 0.0) for pid in r.player_id}
     lab, pos = {}, {}
-    for p in sorted(r, key=lambda p: -(tbl.loc[p.player_id, "war_todate"] if p.player_id in tbl.index else -9)):
-        war = tbl.loc[p.player_id, "war_todate"] if p.player_id in tbl.index else 0.0
-        status = "" if p.status in ("Active", "") else f" · {p.status}"
-        val = f", {money(sv[p.player_id])}" if p.player_id in sv else ""
-        lab[p.player_id] = f"{p.name} ({p.pos}, {war:.1f} WAR{val}){status}"
-        pos[p.player_id] = p.pos
+    for pid in sorted(r.player_id, key=lambda p: -war[p]):
+        row = r.loc[pid]
+        status = "" if row.status in ("Active", "") else f" · {row.status}"
+        val = f", {money(sv[pid])}" if pid in sv else ""
+        lab[pid] = f"{row['name']} ({row.pos}, {war[pid]:.1f} WAR{val}){status}"
+        pos[pid] = row.pos
     return lab, pos
 
 
@@ -171,8 +197,31 @@ with c1:
 with c2:
     send_b = st.multiselect(f"{teams.loc[team_b, 'short']} send", list(lab_b), format_func=lab_b.get,
                             placeholder="Players leaving Team B")
-st.caption("Each player shows WAR so far this season and his default **surplus value**: projected production "
-           "minus predicted salary over his years of control. Trade value below lets you edit the contract.")
+st.caption(f"Each player shows WAR for {ctx.pv.recent_label} and his default **surplus value**: projected "
+           "production minus predicted salary over his years of control. You can edit the contract under Trade value.")
+
+# ------------------------------------------------------------------ free agents
+
+fa_a, fa_b = [], []
+fat = free_agent_table(as_of, round(growth, 4))
+if len(fat):
+    def fa_label(pid):
+        r = fat.loc[pid]
+        age = f"{r.age:.0f}" if pd.notna(r.age) else "?"
+        return (f"{r['name']} ({r.pos}, {age}) · proj. {r.war_season:.1f} WAR · predicted "
+                f"{money(r.fa_salary)}/yr × {int(r.fa_years)} · last with {r.last_team}")
+    with st.expander(f"✍️ Sign free agents ({len(fat)} unsigned players who played in the majors recently)",
+                     expanded=offseason):
+        st.caption("Sorted by projected WAR for a full season. Contract terms are predicted from historical "
+                   "comparable free agents and can be edited under Trade value. Signings change the signing "
+                   "team's depth chart and odds. The other team isn't affected.")
+        c1, c2 = st.columns(2)
+        with c1:
+            fa_a = st.multiselect(f"{teams.loc[team_a, 'short']} sign", list(fat.index), format_func=fa_label,
+                                  placeholder="Free agents joining Team A")
+        with c2:
+            fa_b = st.multiselect(f"{teams.loc[team_b, 'short']} sign", [i for i in fat.index if i not in fa_a],
+                                  format_func=fa_label, placeholder="Free agents joining Team B")
 
 # ------------------------------------------------------------------ custom players
 
@@ -181,8 +230,6 @@ if "custom_players" not in st.session_state:
 library: list[dict] = st.session_state.custom_players
 abbr_a, abbr_b = teams.loc[team_a, "abbr"], teams.loc[team_b, "abbr"]
 HITTER_POS = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"]
-
-
 def custom_label(spec: dict) -> str:
     if spec["kind"] == "Hitter":
         what = f"{spec['pos']}, " + (f"{spec['value']:.1f} WAR/650 PA" if spec["mode"] == "WAR pace"
@@ -290,10 +337,19 @@ include_prospects = st.toggle(
          "You grade each prospect, and the app turns the grade into trade value.",
 )
 if include_prospects:
-    milb = milb_stats(season, as_of)
+    # Before a season starts, prospects are judged on last season's full minor-league stats.
+    if offseason and as_of < date(season, 2, 1):
+        milb_season, milb_date = season - 1, data.season_dates(season - 1)[1]
+    else:
+        milb_season, milb_date = season, as_of
+    milb = milb_stats(milb_season, milb_date)
     p_info: dict[int, dict] = {}
 
-    est = prospect_estimates(season, as_of)
+    est = prospect_estimates(milb_season, milb_date)
+
+    def default_eta(level):
+        # ETA counts seasons from the target season; over the winter a season of development has passed
+        return max(prospects.DEFAULT_ETA.get(level, 3) - (1 if offseason else 0), 0)
 
     def prospect_labels(team_id, forty_ids):
         lst = org_prospects(team_id, as_of, tuple(sorted(forty_ids)))
@@ -301,6 +357,8 @@ if include_prospects:
         for pr in lst:
             age = players._age_on(pr.birth_date, as_of)
             sm = prospects.summarize_stats(milb, pr.player_id, age)
+            if offseason and as_of < date(season, 2, 1):
+                sm["line"] = sm["line"].replace(": ", f" ({milb_season}): ", 1) if sm["level"] else sm["line"]
             e = est.loc[pr.player_id] if pr.player_id in est.index else None
             grade = int(e.est_grade) if e is not None else 40
             rank = int(e["rank"]) if e is not None else None
@@ -311,7 +369,7 @@ if include_prospects:
         for _, pid in sorted(rows):
             i = p_info[pid]
             agetxt = f"{i['age']:.0f}" if i["age"] is not None else "?"
-            eta = prospects.DEFAULT_ETA.get(i["level"], 3)
+            eta = default_eta(i["level"])
             pv = prospects.prospect_value(i["est_grade"], eta, i["pitcher_stats"] or i["pos"] == "P",
                                           i["age"], season, growth).surplus
             rk = f"#{i['est_rank']}, " if i["est_rank"] else ""
@@ -343,8 +401,8 @@ if include_prospects:
             "Each prospect starts at his **estimated Future Value grade** (20–80 scouting scale). Change it if "
             "you disagree, for example to match a published prospect ranking. ETA is the number of seasons until he's expected to reach the majors. Value accounts "
             "for bust risk (higher for pitchers and for prospects further away), six years of team control, "
-            "and predicted pre-arbitration and arbitration salaries. Prospects don't change this season's "
-            "playoff odds."
+            "and predicted pre-arbitration and arbitration salaries. Prospects don't change the "
+            f"{season} playoff odds."
         )
         prow = []
         for pid in pros_a + pros_b:
@@ -354,7 +412,7 @@ if include_prospects:
             prow.append({
                 "pid": pid, "Prospect": i["name"],
                 "Grade": prospects.GRADE_LABELS[i["est_grade"]],
-                "ETA (yrs)": prospects.DEFAULT_ETA.get(i["level"], 3),
+                "ETA (yrs)": default_eta(i["level"]),
                 "Type": "Pitcher" if pitcher else "Hitter",
                 "Pos": i["pos"],
                 "Age": None if i["age"] is None else round(i["age"], 1),
@@ -392,75 +450,109 @@ if include_prospects:
                 "war_total": pv.war_total,
             })
 
+# ------------------------------------------------------------------ the deal
+
 value_players: list[dict] = []
-moves = None
-if send_a or send_b or custom_in:
-    positions = {**pos_a, **pos_b}
-    real = players.player_rates(ctx.pv, ctx.hp, ctx.pp, send_a + send_b, as_of, positions) \
-        if (send_a or send_b) else pd.DataFrame()
-    if len(real):
-        real["to_id"] = [team_b if p in send_a else team_a for p in real.player_id]
-        real["from_id"] = [team_a if p in send_a else team_b for p in real.player_id]
-    custom_rows = []
-    for spec, to_id, from_id in custom_in:
-        row = players.custom_player_rates(spec, ctx.pv.ctx)
-        row.update(player_id=spec["id"], to_id=to_id, from_id=from_id)
-        custom_rows.append(row)
-    rates = pd.concat([real, pd.DataFrame(custom_rows)], ignore_index=True)
-    rates["from"] = [teams.loc[f, "abbr"] if pd.notna(f) else "Outside" for f in rates.from_id]
+moves_spec: list[dict] = []          # what goes into the depth-chart re-run
+deal_rows: list[dict] = []           # one row per player for the tables below
+for pid in send_a + send_b:
+    frm, to = (team_a, team_b) if pid in send_a else (team_b, team_a)
+    r = ctx.rates.loc[pid]
+    moves_spec.append({"player_id": int(pid), "from_id": int(frm), "to_id": int(to)})
+    deal_rows.append({**r[["name", "pos", "age"] + RATE_COLS + ["sp_share"]].to_dict(),
+                      "player_id": int(pid), "from_id": frm, "to_id": to, "kind": "player"})
+for pid in fa_a + fa_b:
+    to = team_a if pid in fa_a else team_b
+    r = fat.loc[pid]
+    spec = {"player_id": int(pid), "from_id": None, "to_id": int(to), "pos": r.pos,
+            **{c: float(r[c]) for c in RATE_COLS + ["sp_share"]}}
+    moves_spec.append(spec)
+    deal_rows.append({**r[["name", "pos", "age"] + RATE_COLS + ["sp_share"]].to_dict(),
+                      "player_id": int(pid), "from_id": None, "to_id": to, "kind": "free agent",
+                      "fa_salary": float(r.fa_salary), "fa_years": int(r.fa_years)})
+for spec, to_id, from_id in custom_in:
+    row = players.custom_player_rates(spec, ctx.pv.ctx)
+    sp_share = 1.0 if spec.get("role") == "SP" else 0.0
+    moves_spec.append({"player_id": int(spec["id"]), "from_id": None if from_id is None else int(from_id),
+                       "to_id": int(to_id), "pos": row["pos"], "sp_share": sp_share,
+                       **{c: float(row[c]) for c in RATE_COLS}})
+    deal_rows.append({**{k: row[k] for k in ["name", "pos", "age", "war_pace"] + RATE_COLS},
+                      "sp_share": sp_share, "player_id": int(spec["id"]), "from_id": from_id, "to_id": to_id,
+                      "kind": "custom"})
+# a custom player "from the other team" isn't on that roster; it's only removed there in spirit
+for m in moves_spec:
+    if m["player_id"] < 0:
+        m["from_id"] = None
+
+moves_json = None
+if deal_rows:
+    rates = pd.DataFrame(deal_rows)
+    _, allocs_auto = trade.trade_effect(ctx, moves_spec)
+    rates["season_pa"] = [float(allocs_auto[t].loc[p, "pa"]) if p in allocs_auto[t].index else 0.0
+                          for p, t in zip(rates.player_id, rates.to_id)]
+    rates["season_ip"] = [float(allocs_auto[t].loc[p, "ip"]) if p in allocs_auto[t].index else 0.0
+                          for p, t in zip(rates.player_id, rates.to_id)]
+    rates["exp_pa"] = (rates.season_pa * rates.to_id.map(rem_frac)).round(0)
+    rates["exp_ip"] = (rates.season_ip * rates.to_id.map(rem_frac)).round(1)
+    rates["from"] = [teams.loc[f, "abbr"] if pd.notna(f) else ("Free agent" if k == "free agent" else "Outside")
+                     for f, k in zip(rates.from_id, rates.kind)]
     rates["to"] = [teams.loc[t, "abbr"] for t in rates.to_id]
-    rates["rem_pa"] = (rates.rem_pa_per_g * rates.to_id.map(ctx.rem_games)).round(0)
-    rates["rem_ip"] = (rates.rem_ip_per_g * rates.to_id.map(ctx.rem_games)).round(1)
+    tbl = ctx.pv.table
+    rates["recent_war"] = [tbl.loc[p, "war_todate"] if p in tbl.index else np.nan for p in rates.player_id]
 
     st.subheader("Players in the deal")
+    span = f"the rest of the {season} season" if not offseason else f"the {season} season"
     st.caption(
-        "Remaining PA and IP default to each player's season-to-date rate per team game. Custom players "
-        "default to everyday hitter, rotation starter, or regular reliever usage. Edit them for injuries, "
-        "role changes, or a hitter you expect to play every day."
+        f"Expected PA and IP over {span} come from each player's spot on his new team's automatic depth chart. "
+        "The depth chart is re-run after the move, so a star pushes a bench player out of the lineup. "
+        "Edit them for injuries or a different role."
     )
     edit = st.data_editor(
-        rates[["name", "pos", "from", "to", "PA", "IP", "war_todate", "rem_pa", "rem_ip"]],
+        rates[["name", "pos", "from", "to", "recent_war", "exp_pa", "exp_ip"]],
         column_config={
             "name": "Player", "pos": "Pos", "from": "From", "to": "To",
-            "PA": st.column_config.NumberColumn("PA so far", disabled=True),
-            "IP": st.column_config.NumberColumn("IP so far", disabled=True, format="%.1f"),
-            "war_todate": st.column_config.NumberColumn("WAR so far", disabled=True, format="%.1f"),
-            "rem_pa": st.column_config.NumberColumn("Remaining PA", min_value=0, max_value=450, step=5),
-            "rem_ip": st.column_config.NumberColumn("Remaining IP", min_value=0.0, max_value=150.0, step=1.0, format="%.1f"),
+            "recent_war": st.column_config.NumberColumn(f"WAR ({ctx.pv.recent_label})", disabled=True,
+                                                        format="%.1f"),
+            "exp_pa": st.column_config.NumberColumn("Expected PA", min_value=0, max_value=750, step=10),
+            "exp_ip": st.column_config.NumberColumn("Expected IP", min_value=0.0, max_value=230.0, step=5.0,
+                                                    format="%.1f"),
         },
-        disabled=["name", "pos", "from", "to"], hide_index=True, width="stretch",
+        disabled=["name", "pos", "from", "to"], hide_index=True, width="stretch", key="deal_editor",
     )
-    rates["rem_pa"] = edit["rem_pa"].to_numpy()
-    rates["rem_ip"] = edit["rem_ip"].to_numpy()
+    for k, m in enumerate(moves_spec):
+        f = float(rem_frac[m["to_id"]]) or 1.0
+        if abs(float(edit.exp_pa.iloc[k]) - float(rates.exp_pa.iloc[k])) > 0.5:
+            m["fixed_pa"] = float(edit.exp_pa.iloc[k]) / f
+        if abs(float(edit.exp_ip.iloc[k]) - float(rates.exp_ip.iloc[k])) > 0.05:
+            m["fixed_ip"] = float(edit.exp_ip.iloc[k]) / f
+    deltas_now, allocs_after = trade.trade_effect(ctx, moves_spec)
+    rates["season_pa"] = [float(allocs_after[t].loc[p, "pa"]) if p in allocs_after[t].index else 0.0
+                          for p, t in zip(rates.player_id, rates.to_id)]
+    rates["season_ip"] = [float(allocs_after[t].loc[p, "ip"]) if p in allocs_after[t].index else 0.0
+                          for p, t in zip(rates.player_id, rates.to_id)]
+    moves_json = json.dumps(moves_spec)
 
-    # Rest-of-season WAR each model credits to each player
     rpw = ctx.pv.ctx.runs_per_win
-    show = pd.DataFrame({"Player": rates.name})
-    show["WAR (to date) model"] = ((rates.todate_off_per_pa + rates.def_per_pa) * rates.rem_pa
-                                   + rates.todate_pit_per_ip * rates.rem_ip) / rpw
-    show["Projection model"] = ((rates.proj_off_per_pa + rates.def_per_pa) * rates.rem_pa
-                                + rates.proj_pit_per_ip * rates.rem_ip) / rpw
-    show["Run diff: runs scored"] = rates.todate_off_per_pa * rates.rem_pa
-    show["Run diff: runs prevented"] = rates.def_per_pa * rates.rem_pa + rates.todate_pit_per_ip * rates.rem_ip
-    with st.expander("Rest-of-season value by model", expanded=False):
-        st.dataframe(show.style.format({c: "{:+.2f}" for c in show.columns[1:]}),
-                     hide_index=True, width="stretch")
-        st.caption("WAR columns are wins above replacement over the remaining games; run-diff columns are runs. "
-                   "Custom players have the same value in every model.")
-
-    arrive = rates.assign(team_id=rates.to_id, sign=1)
-    depart = rates[rates.from_id.notna()].assign(sign=-1)
-    depart["team_id"] = depart.from_id.astype(int)
-    moves = pd.concat([arrive, depart], ignore_index=True)[
-        ["team_id", "sign", "rem_pa", "rem_ip", "todate_off_per_pa", "def_per_pa",
-         "todate_pit_per_ip", "proj_off_per_pa", "proj_pit_per_ip"]]
-    moves["team_id"] = moves.team_id.astype(int)
+    with st.expander("Projected wins added, by model", expanded=False):
+        wins = pd.DataFrame({
+            "Team": [teams.loc[t, "abbr"] for t in deltas_now.index],
+            "WAR (recent)": deltas_now.war_runs / rpw,
+            "Projection": deltas_now.proj_runs / rpw,
+            "Run diff: runs scored": deltas_now.rd_rs,
+            "Run diff: runs allowed": deltas_now.rd_ra,
+        })
+        st.dataframe(wins.style.format({c: "{:+.1f}" for c in wins.columns[1:]}), hide_index=True, width="stretch")
+        st.caption("Full-season effect of the move on each team after re-running its depth chart. WAR columns "
+                   f"are wins, and run columns are runs. During the season only the remaining {season} games are "
+                   "affected.")
 
     # ---------------------------------------------------------- trade value inputs
     st.subheader("Trade value")
     st.caption(
         "Surplus value = projected WAR × market $/WAR, minus salary, over the years of team control "
-        f"(this season's remaining {ctx.rem_games[team_a] / 162:.0%} plus future seasons), discounted 8% a year. "
+        f"({'the remaining ' + format(float(rem_frac[team_a]), '.0%') + ' of ' if not offseason else 'all of '}"
+        f"the {season} season plus future seasons), discounted 8% a year. Free agents are valued on the "
+        "contract you give them. "
         "**Salaries are predicted from historical comparable players**: the 30 most similar seasons "
         "by service class, age, service time and recent WAR (2000–2016), scaled to the league-average salary "
         f"of each season (growing {growth:.1%}/yr after 2025). Years of control come from service time. "
@@ -470,6 +562,10 @@ if send_a or send_b or custom_in:
     custom_by_id = {x["id"]: x for x in library}
     rates = rates.reset_index(drop=True)
     defaults = trade.player_value_defaults(ctx, rates, growth, custom_by_id)
+    for k, d in enumerate(defaults):          # free agents: years and salary of the new contract
+        if rates.kind.iloc[k] == "free agent":
+            d["control"] = int(rates.fa_years.iloc[k]) - 1
+            d["salary"] = float(rates.fa_salary.iloc[k])
     ages = [d["age"] for d in defaults]
     services = [d["service"] for d in defaults]
     priors = [d["priors"] for d in defaults]
@@ -500,7 +596,8 @@ if send_a or send_b or custom_in:
                 help="Full-season projection at the player's current playing time (projection model)."),
             "control": st.column_config.NumberColumn(
                 "Control (yrs)", min_value=0, max_value=12, step=1,
-                help="Seasons the acquiring team controls the player beyond this one."),
+                help=f"Seasons the acquiring team controls the player beyond {season}. For a free agent, "
+                     "the length of his new contract minus one."),
             "salary": st.column_config.NumberColumn(
                 "Avg salary ($M/yr)", min_value=0.0, max_value=70.0, step=0.5, format="$%.1fM",
                 help="Average of the predicted salaries over the control period. Type a number to replace "
@@ -515,7 +612,11 @@ if send_a or send_b or custom_in:
         edited_war_or_ctl = (war_s != float(r.war_season)) or (control != int(r.control))
         pth = predicted_path(k, war_s, control) if edited_war_or_ctl else paths[k]
         typed = float(vedit.salary.iloc[k])
-        salary_used = pth.salaries if abs(typed - float(r.salary)) < 0.05 else typed
+        if r.kind == "free agent" and abs(typed - float(r.salary)) < 0.05:
+            typed = float(r.salary)
+            salary_used = typed
+        else:
+            salary_used = pth.salaries if abs(typed - float(r.salary)) < 0.05 else typed
         rem_frac = float(ctx.rem_games[r.to_id]) / 162
         sv = value.surplus_value(war_s, ages[k], control, salary_used, rem_frac, season, growth)
         value_players.append({"name": r["name"], "to_id": int(r.to_id),
@@ -552,9 +653,8 @@ if send_a or send_b or custom_in:
 
 # ------------------------------------------------------------------ simulate
 
-res_raw, deltas = simulate_cached(
-    season, as_of, moves.to_json() if moves is not None else None, tuple(model_keys), sims, int(seed)
-)
+res_raw, deltas = simulate_cached(as_of, moves_json, tuple(model_keys), sims, int(seed))
+moves = moves_json
 res = {k: pd.Series(v) for k, v in res_raw.items()}
 
 
@@ -574,10 +674,10 @@ all_values = value_players + prospect_values
 if all_values:
     pdelta = {t: blend("after", "playoff", t) - blend("before", "playoff", t) for t in (team_a, team_b)}
     verdicts = value.evaluate(all_values, pdelta, (team_a, team_b), spot_value, tol_pct)
-    st.subheader("Trade verdict")
+    st.subheader("Deal verdict")
     no = [v for v in verdicts.values() if not v.accepts]
     if not no:
-        st.success("✅ **Trade accepted.** Both teams come out within their tolerance.")
+        st.success("✅ **Deal accepted.** Both teams come out within their tolerance.")
     else:
         msgs = []
         for v in no:
@@ -585,7 +685,7 @@ if all_values:
             gap = -v.net - v.tolerance
             msgs.append(f"the **{short}** say no: they'd lose **${-v.net:.1f}M** of value. Their limit is "
                         f"${v.tolerance:.1f}M, so add about **${gap:.1f}M** more for them.")
-        st.error("❌ **Trade rejected.** " + " Also, ".join(m[0].upper() + m[1:] for m in msgs)
+        st.error("❌ **Deal rejected.** " + " Also, ".join(m[0].upper() + m[1:] for m in msgs)
                  + " The playoff odds below are still shown so you can explore.")
     vc = st.columns(2)
     for col, t in zip(vc, (team_a, team_b)):
@@ -705,14 +805,15 @@ st.altair_chart(chart)
 
 # league-wide table
 st.subheader("Everyone else")
-st.caption("A trade also shifts the odds of the teams competing with the two trade partners for spots.")
+st.caption("A move also shifts the odds of the teams competing with the two clubs for playoff spots.")
 base_wp = trade.scenario_wp(ctx, None)
 lg_rows = []
 for tid in ctx.teams.team_id:
     b, a, d = shown(blend("before", "playoff", tid), blend("after", "playoff", tid))
     lg_rows.append({
         "Team": teams.loc[tid, "name"], "League": teams.loc[tid, "league"], "Division": teams.loc[tid, "division"],
-        "W": int(ctx.base.loc[tid, "W"]), "L": int(ctx.base.loc[tid, "L"]),
+        **({"Proj. W": round(float(np.mean([base_wp[m][idx[tid]] for m in model_keys]) * 162))}
+           if offseason else {"W": int(ctx.base.loc[tid, "W"]), "L": int(ctx.base.loc[tid, "L"])}),
         "Talent W%": float(np.mean([base_wp[m][idx[tid]] for m in model_keys])),
         "Playoffs before": b, "Playoffs after": a, "Δ pts": d,
     })
@@ -734,38 +835,51 @@ for tab, lgname in zip(tabs, leagues + ["All"]):
 with st.expander("How it works"):
     c = ctx.pv.ctx
     st.markdown(f"""
-**Simulation.** Every regular-season game after the as-of date is simulated {sims:,} times. Each game's
-home-win probability comes from the two teams' talent win% (log5) plus home-field advantage (.540).
-Each simulated season also draws its own "true" talent for every team around the estimate. The spread
-is about ±.035 before the season and narrows as games are played, so early-season odds aren't
-overconfident.
-Playoff spots follow the 12-team format: 3 division winners and 3 wild cards per league, with the top
-two division winners getting byes.
+**Which playoffs.** Odds are always for the next playoffs after the chosen date: that season's through
+the last day of its regular season, then the following season's. Games through the date count as played,
+and every later game is simulated {sims:,} times.
+
+**Simulation.** Each game's home-win probability comes from the two teams' talent win% (log5) plus
+home-field advantage (.540). Each simulated season also draws its own "true" talent for every team. The
+spread is about ±.041 (±6.6 wins) before a season, matching how far preseason estimates actually missed
+in 2023–26, and it narrows as games are played. Playoff spots follow the 12-team format: 3 division
+winners and 3 wild cards per league, with the top two division winners getting byes.
 
 **Tiebreakers.** These follow MLB's rules (no tiebreaker games): head-to-head record (combined among
 all tied clubs when 3 or more are tied), then intradivision record, then intraleague record, then record in
 the last half of intraleague games, extended back one game at a time. Run on the full 2022–2025
 seasons, the simulator reproduces every actual playoff field and seed.
 
-**Team talent.** For the WAR and projection models, talent is half actual record and half Pythagorean
-record, regressed toward a prior with 70 games of weight. The prior is last season's Pythagorean record,
-regressed halfway to .500. The run-differential model regresses runs scored and allowed per game
-separately (40 games), then converts them with Pythagenpat.
+**Rosters and depth charts.** Each club's roster on the date comes from every player's dated roster
+history. An automatic depth chart ranks the roster by projection and hands out a season's playing time:
+a starting and backup catcher, 8 regulars, 4 bench bats, a 5-man rotation plus 2 depth starters, 7 relievers
+and 3 mop-up arms. The remainder (injuries, call-ups) is filled at replacement level, and players on the
+injured list get less time during the season. Team strength is the sum of each player's rate × playing time.
+
+**Team talent.** Before a season, each team's talent blends last season's Pythagorean record with its
+roster projection, using weights fit on opening days 2023–26. Roster projections alone missed by more
+(9.9–10.3 wins RMSE) than last season's record (9.3). The blend did slightly better (9.1–9.4), which is
+about as well as preseason forecasts can do given 162-game luck. During the season, results so far
+(half record, half Pythagorean) are blended with that preseason estimate at 70 games of weight
+(runs scored and allowed separately at 40 games for the run-differential model).
 
 **Player value.** Hitters get wOBA-based batting runs, plus baserunning (SB/CS), plus a positional
 adjustment. Pitchers get FIP-based runs saved, with replacement level set separately for starters and
 relievers. Replacement level is calibrated to 1,000 WAR per season (57% hitters, 43% pitchers).
-Runs per win this season: **{c.runs_per_win:.2f}**.
-- *WAR (to date)*: season-to-date runs above replacement per PA or IP, times remaining playing time.
-  The total is converted to wins and spread over the team's remaining games.
+Runs per win: **{c.runs_per_win:.2f}**.
+- *WAR (recent)*: runs above replacement per PA or IP over {ctx.pv.recent_label}. Before about a month
+  of games, this is last season plus the new season so far.
 - *Projection (Marcel)*: weights this season and the three prior seasons 6/5/4/3 for hitters and
   4/3/2/1 for pitchers, regresses to league average, and adjusts for age.
-- *Run differential*: offensive runs move the team's runs scored. Pitching and defensive runs move
+- *Run differential*: recent offensive runs move the team's runs scored. Pitching and defensive runs move
   runs allowed. Win% is then recomputed with Pythagenpat, so a great player helps a bit less on an
   already-great team.
 
-**Trade logic.** A departing player's playing time is filled at replacement level, and an arriving
-player's time displaces replacement level. This is why the remaining PA and IP you enter matter.
+**Trades and signings.** A move re-runs the depth charts of both clubs. The arriving player takes the
+role his projection earns, the players behind him lose playing time, and the departing player's time
+goes to whoever is next on the depth chart. The full-season change in team strength applies to whatever
+games remain. Free agents are anyone with no club on the date who played in the majors this season or
+last. Their default contract comes from historical comparable free agents.
 
 **Custom players.** You describe a custom player's talent directly, as a WAR pace (per 650 PA, or per
 180 IP for starters and 65 IP for relievers) or as a rate stat (wRC+ for hitters, FIP or ERA for pitchers).
@@ -788,5 +902,6 @@ away) scales that down. Six years of control at predicted pre-arb and arbitratio
 value, discounted from his debut. Prospects affect trade value only, not this season's odds.
 
 **Not modeled.** Park factors, fielding metrics beyond the positional adjustment, reliever leverage,
+platoons, minor leaguers outside the 40-man (except as prospects in trades), a new labor agreement's rules,
 injuries after the as-of date (edit playing time instead), and postseason series odds.
 """)

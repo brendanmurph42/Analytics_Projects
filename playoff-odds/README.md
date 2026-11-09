@@ -1,6 +1,8 @@
-# Trade Playoff Odds
+# Playoff Odds
 
-A Streamlit app that estimates every MLB team's playoff probability **as of any date from 2022 to 2026**. It then re-runs the season with a **hypothetical trade** applied, so you can see how much a deal moves the needle for both teams and for everyone they're competing with.
+A Streamlit app that estimates every MLB team's chance of making **the next playoffs** as of any date since 2022. It opens on today. Through the last day of a regular season, that means that season's playoffs. After it, during the postseason and the winter, it means next season's. As of November 2026 it shows the **2027 playoff odds**, projected from each club's current roster.
+
+Then try a move, such as a **trade, a free-agent signing, or a prospect deal**. The app re-runs the depth charts and the season to show how the odds change for both clubs and for everyone they're competing with. It also judges whether each side would accept the deal.
 
 ## Run it
 
@@ -10,25 +12,34 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/streamlit run app.py
 ```
 
-Data comes from the free MLB Stats API and is cached in `.cache/`. The first load of a season takes a few seconds, and later loads are instant.
+Data comes from the free MLB Stats API and is cached in `.cache/`. The first load for a new date takes 10–20 seconds (rosters for all 30 clubs), and later loads are instant.
 
 ## How to use
 
-1. In the sidebar, pick a season and an as-of date. Games on or before that date count as played, and every later game is simulated.
-2. Pick Team A and Team B, then the players each side sends. Rosters reflect who was in each organization on that date, including injured-list players.
-3. Optionally add **custom players**: free agents, prospects, or hypothetical players that you describe by talent level instead of looking up. Choose which team each one joins, and whether they come from outside the deal or from the other team.
-4. Adjust **Remaining PA / IP** for each player if you expect a different role or an injury.
-5. Read the before/after odds: make playoffs, win division, first-round bye, projected wins, the seed distribution, and the league-wide ripple effects.
+1. In the sidebar, pick the as-of date. It defaults to today. The title shows which playoffs the odds are for.
+2. Pick Team A and Team B, then the players each side sends. Rosters show who was with each club on that date, including injured-list players.
+3. Optionally **sign free agents**: unsigned players who played in the majors this season or last, with projected WAR and a predicted contract.
+4. Optionally add **custom players** or turn on **prospects**.
+5. Adjust **Expected PA / IP** if you expect a different role or an injury.
+6. Read the verdict and the before/after odds: make playoffs, win division, first-round bye, projected wins, the seed distribution, and the league-wide ripple effects.
+
+## How teams are projected
+
+- **Rosters on the date** come from every player's dated roster history. That's more reliable than the API's roster lists, which return only today's players for the current year and drop anyone who later left a club.
+- **Automatic depth charts** rank each roster by projection and assign a season's playing time: starting and backup catcher, 8 regulars, 4 bench bats, a 5-man rotation plus 2 depth starters, 7 relievers, and 3 mop-up arms. The rest is filled at replacement level. Team strength is the sum of rate × playing time.
+- **Before a season**, talent blends last season's Pythagorean record with the roster projection, using weights fit on opening days 2023–26. In leave-one-season-out tests, the blend missed actual records by 9.1–9.4 wins (RMSE). That compares with 9.3 for last season's record alone, 9.9–10.3 for roster projections alone, and an SD of 12.0 wins in actual records. Preseason uncertainty in the simulation (±6.6 wins) is set from those misses.
+- **During a season**, results so far are blended with the preseason estimate, at 70 games of weight.
+- **Trades and signings** re-run both clubs' depth charts. The newcomer takes the role his projection earns, and everyone behind him loses playing time.
 
 ## The three models
 
-| Model | Player value | Team effect |
+| Model | Player rates | Team effect |
 |---|---|---|
-| **WAR (to date)** | Season-to-date runs above replacement (fWAR-style: wOBA batting, baserunning, positional adjustment, FIP pitching) | Runs → wins, added to the team's talent win% |
-| **Projection (Marcel)** | Weighted current + 3 prior seasons, regressed to average, age-adjusted | Same as WAR |
-| **Run differential** | Season-to-date runs, split into offense and run prevention | Moves team runs scored / allowed, then win% via Pythagenpat (diminishing returns) |
+| **WAR (recent)** | Runs above replacement this season so far (last season plus this one before about a month of games): wOBA batting, baserunning, positional adjustment, FIP pitching | Runs → wins |
+| **Projection (Marcel)** | Weighted current + 3 prior seasons, regressed to average, age-adjusted | Runs → wins |
+| **Run differential** | Recent runs, split into offense and run prevention | Moves runs scored / allowed, then win% via Pythagenpat (diminishing returns) |
 
-The headline number is the average of whichever models you select.
+All three use the same depth charts, and the headline number is the average of whichever models you select. MLB's labor agreement expired December 1, 2026, so 2027 odds assume the current schedule and 12-team format.
 
 ## Custom players
 
@@ -37,7 +48,7 @@ You don't need a player to exist in MLB's data. Open **Custom players** and desc
 - **WAR pace**: WAR per 650 PA for hitters, or per 180 IP (starters) / 65 IP (relievers) for pitchers. 2 is average, 5 is all-star, and 8+ is MVP-level.
 - **Rate stat**: wRC+ for hitters (100 = league average, plus a position), or FIP / ERA for pitchers.
 
-The app converts that to runs per PA or IP using the selected season's league constants. Custom players default to everyday-hitter, rotation-starter, or regular-reliever playing time, which you can edit. The list lasts for your browser session. Use **Download list** to save it as JSON, and upload that file next time.
+The app converts that to runs per PA or IP using the season's league constants. Custom players get whatever role their talent earns on the new club's depth chart, which you can edit. The list lasts for your browser session. Use **Download list** to save it as JSON, and upload that file next time.
 
 Real players don't need manual updates either. Stats and rosters come live from the MLB Stats API for whatever date you pick.
 
@@ -101,11 +112,12 @@ The risk factors are tuned so a hitter about a year away lands near rough public
 
 ```
 app.py                    Streamlit UI
-playoff_odds/data.py      MLB Stats API client + disk cache, rosters by date
+playoff_odds/data.py      MLB Stats API client + disk cache, rosters and free agents by date
 playoff_odds/players.py   Player valuation (WAR-style rates, Marcel projections)
 playoff_odds/strength.py  Team talent estimates, log5 game probabilities
 playoff_odds/simulate.py  Season simulator + tiebreakers
-playoff_odds/trade.py     Trade deltas per model, before/after runs
+playoff_odds/trade.py     Context for a date, trade/signing effects, before/after runs
+playoff_odds/depth.py     Automatic depth charts and roster-based team projections
 playoff_odds/value.py     Surplus value and accept/reject verdicts
 playoff_odds/contracts.py Contract predictions from historical comps
 playoff_odds/prospects.py Prospect grades (historical comps) and grade-to-value model

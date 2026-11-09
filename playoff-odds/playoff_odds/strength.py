@@ -48,12 +48,32 @@ def team_totals(games: pd.DataFrame, team_ids) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("team_id")
 
 
-def baseline_strength(season: int, as_of: date, teams: pd.DataFrame, sched: pd.DataFrame) -> pd.DataFrame:
+def league_rpg(season: int, as_of: date, sched: pd.DataFrame) -> float:
+    """Runs per team-game: last season, blended with this season once there's a sample."""
+    prev = data.get_schedule(season - 1)
+    prev = prev[prev.final]
+    lg = (prev.home_score.sum() + prev.away_score.sum()) / (2 * len(prev))
+    cur = sched[(sched.date <= pd.Timestamp(as_of)) & sched.final]
+    if len(cur) > 150:
+        lg = 0.5 * lg + 0.5 * (cur.home_score.sum() + cur.away_score.sum()) / (2 * len(cur))
+    return float(lg)
+
+
+def baseline_strength(season: int, as_of: date, teams: pd.DataFrame, sched: pd.DataFrame,
+                      prior: pd.DataFrame | None = None) -> pd.DataFrame:
+    """True-talent estimates per model, blending results so far with a prior.
+
+    ``prior`` (indexed by team_id) holds roster-based projections: columns
+    wp_war, wp_proj (win%) and rs, ra (runs per game) for the
+    run-differential model. Without it, the prior is last season's
+    Pythagorean record regressed halfway to average.
+    """
     ids = teams.team_id.tolist()
-    played = sched[sched.date <= pd.Timestamp(as_of)]
+    played = sched[(sched.date <= pd.Timestamp(as_of)) & sched.final]
     cur = team_totals(played, ids)
 
     prev_sched = data.get_schedule(season - 1)
+    prev_sched = prev_sched[prev_sched.final]
     prev = team_totals(prev_sched, ids)
     lg_rpg = (prev.RS.sum()) / prev.G.sum()
     if cur.G.sum() > 300:  # blend in this season's scoring environment once available
@@ -61,9 +81,15 @@ def baseline_strength(season: int, as_of: date, teams: pd.DataFrame, sched: pd.D
 
     prev_rs = prev.RS / prev.G
     prev_ra = prev.RA / prev.G
-    prior_wp = 0.5 + 0.5 * (pythag(prev_rs, prev_ra) - 0.5)
-    prior_rs = 0.5 * lg_rpg + 0.5 * prev_rs
-    prior_ra = 0.5 * lg_rpg + 0.5 * prev_ra
+    if prior is None:
+        pw = 0.5 + 0.5 * (pythag(prev_rs, prev_ra) - 0.5)
+        prior_wp = {"war": pw, "proj": pw}
+        prior_rs = 0.5 * lg_rpg + 0.5 * prev_rs
+        prior_ra = 0.5 * lg_rpg + 0.5 * prev_ra
+    else:
+        pr = prior.loc[cur.index]
+        prior_wp = {"war": pr.wp_war, "proj": pr.wp_proj}
+        prior_rs, prior_ra = pr.rs, pr.ra
 
     g = cur.G.astype(float)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -75,7 +101,9 @@ def baseline_strength(season: int, as_of: date, teams: pd.DataFrame, sched: pd.D
 
     out = pd.DataFrame(index=cur.index)
     out["G"], out["W"], out["L"], out["RS"], out["RA"] = cur.G, cur.W, cur.L, cur.RS, cur.RA
-    out["wp"] = (g * obs_wp + WP_REGRESS_GAMES * prior_wp) / (g + WP_REGRESS_GAMES)
+    for m in ("war", "proj"):
+        out[f"wp_{m}"] = (g * obs_wp + WP_REGRESS_GAMES * prior_wp[m]) / (g + WP_REGRESS_GAMES)
+    out["wp"] = out.wp_proj
     out["rs"] = (g * rs_pg + RUNS_REGRESS_GAMES * prior_rs) / (g + RUNS_REGRESS_GAMES)
     out["ra"] = (g * ra_pg + RUNS_REGRESS_GAMES * prior_ra) / (g + RUNS_REGRESS_GAMES)
     out["wp_rd"] = pythag(out.rs, out.ra)
@@ -94,13 +122,16 @@ def game_probs(home_idx: np.ndarray, away_idx: np.ndarray, wp: np.ndarray) -> np
     return o / (1 + o)
 
 
-TALENT_PRIOR_SD = 0.035
+# Preseason talent uncertainty. The blended preseason estimate missed actual
+# records by 9.2 wins (RMSE, 2023-26); removing the ~6.4 wins of pure
+# 162-game luck leaves ~6.6 wins (.041) of talent uncertainty.
+TALENT_PRIOR_SD = 0.041
 
 
 def talent_sd(games_played) -> np.ndarray:
     """Posterior SD of a team's true-talent win% after n games (normal approx).
 
-    Prior uncertainty around the preseason estimate is ~.035 (~5.7 wins);
+    Prior uncertainty around the preseason estimate is ~.041 (~6.6 wins);
     each game adds binomial information with variance .25.
     """
     n = np.asarray(games_played, float)

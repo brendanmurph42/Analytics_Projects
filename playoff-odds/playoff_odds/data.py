@@ -14,15 +14,16 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
 BASE = "https://statsapi.mlb.com/api/v1"
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache"
-SUPPORTED_SEASONS = (2022, 2023, 2024, 2025, 2026)
+FIRST_SEASON = 2022  # first season with the current 12-team playoff format
 
 _session = requests.Session()
 _session.headers["User-Agent"] = "playoff-odds-tool/1.0"
@@ -81,13 +82,32 @@ def get_teams(season: int) -> pd.DataFrame:
 # ---------------------------------------------------------------- schedule
 
 
-def get_schedule(season: int) -> pd.DataFrame:
-    """All regular-season games that were completed, one row per game.
+def season_dates(season: int) -> tuple[date, date]:
+    """(regular-season start, regular-season end) for a season."""
+    d = _get(f"seasons/{season}", {"sportId": 1}, ttl_days=7)
+    s = (d.get("seasons") or [{}])[0]
+    start = s.get("regularSeasonStartDate") or f"{season}-03-28"
+    end = s.get("regularSeasonEndDate") or f"{season}-09-30"
+    return date.fromisoformat(start), date.fromisoformat(end)
 
-    Postponed / cancelled entries are dropped; a suspended game that was
-    resumed later is kept once (its final completion). Because these are
-    historical seasons, "remaining games" from an as-of date are exactly the
-    completed games dated after it.
+
+def target_season(as_of: date) -> int:
+    """The season whose playoffs come next after ``as_of``.
+
+    Through the last day of a regular season, that season; after it (the
+    postseason and the winter), the following season.
+    """
+    _, end = season_dates(as_of.year)
+    return as_of.year if as_of <= end else as_of.year + 1
+
+
+def get_schedule(season: int) -> pd.DataFrame:
+    """Every regular-season game of a season, one row per game.
+
+    ``final`` marks completed games (with scores); the rest are still
+    scheduled. Postponed games appear once at their makeup date; cancelled
+    games and postponements that were never made up are dropped. A suspended
+    game that was resumed later is kept once.
     """
     is_current = season >= date.today().year
     d = _get(
@@ -105,12 +125,11 @@ def get_schedule(season: int) -> pd.DataFrame:
     for dd in d["dates"]:
         for g in dd["games"]:
             st = g["status"]
-            if st.get("abstractGameState") != "Final":
-                continue
-            if st.get("detailedState") in ("Postponed", "Cancelled"):
-                continue
             home, away = g["teams"]["home"], g["teams"]["away"]
-            if "score" not in home or "score" not in away:
+            final = st.get("abstractGameState") == "Final" and "score" in home and "score" in away
+            if st.get("detailedState") in ("Postponed", "Cancelled") and not final:
+                # a postponed game shows up again at its makeup date; keep that one
+                rows.setdefault(g["gamePk"], None)
                 continue
             rows[g["gamePk"]] = {
                 "game_pk": g["gamePk"],
@@ -118,11 +137,13 @@ def get_schedule(season: int) -> pd.DataFrame:
                 "game_dt": pd.Timestamp(g["gameDate"]),
                 "home_id": home["team"]["id"],
                 "away_id": away["team"]["id"],
-                "home_score": home["score"],
-                "away_score": away["score"],
+                "home_score": home.get("score") if final else np.nan,
+                "away_score": away.get("score") if final else np.nan,
+                "final": final,
             }
-    df = pd.DataFrame(rows.values()).sort_values(["date", "game_dt", "game_pk"]).reset_index(drop=True)
-    df["home_win"] = df["home_score"] > df["away_score"]
+    df = pd.DataFrame([r for r in rows.values() if r is not None])
+    df = df.sort_values(["date", "game_dt", "game_pk"]).reset_index(drop=True)
+    df["home_win"] = df.final & (df.home_score > df.away_score)
     return df
 
 
@@ -192,7 +213,13 @@ def _fetch_stats(group: str, params: dict, ttl_days=None) -> list:
 
 
 def stats_to_date(season: int, as_of: date) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Season-to-date hitting and pitching through `as_of` (inclusive)."""
+    """Season-to-date hitting and pitching through `as_of` (inclusive).
+
+    Empty frames when ``as_of`` is before the season has started.
+    """
+    if as_of < date(season, 2, 1):
+        return (pd.DataFrame(columns=["player_id", "name", "pos", *HIT_COLS.values()]),
+                pd.DataFrame(columns=["player_id", "name", "pos", *PIT_COLS.values()]))
     params = {
         "stats": "byDateRange",
         "season": season,
@@ -352,6 +379,8 @@ def milb_stats_to_date(season: int, as_of: date) -> pd.DataFrame:
     """Season-to-date minor-league hitting and pitching lines, one row per player per level."""
     ttl = 1 if as_of >= date.today() else None
     rows = []
+    if as_of < date(season, 2, 1):
+        return pd.DataFrame()
     for sport, level in MILB_LEVELS.items():
         base = {"stats": "byDateRange", "season": season, "startDate": f"{season}-02-01",
                 "endDate": as_of.isoformat(), "sportId": sport}
@@ -386,3 +415,80 @@ def milb_stats_to_date(season: int, as_of: date) -> pd.DataFrame:
     info = df.groupby("player_id")[["name", "birth_date", "mlb_debut"]].first()
     out = df.groupby(keys, as_index=False).sum(numeric_only=True)
     return out.merge(info, left_on="player_id", right_index=True, how="left")
+
+
+# ---------------------------------------------------------------- free agents
+
+
+@dataclass
+class FreeAgent:
+    player_id: int
+    name: str
+    pos: str
+    birth_date: str | None
+    last_team_id: int | None
+    last_team: str
+
+
+def league_map(as_of: date, team_ids: list[int]) -> tuple[dict[int, list[RosterPlayer]], list[FreeAgent]]:
+    """Every MLB club's roster on ``as_of``, plus the unsigned free agents.
+
+    Candidates: everyone who played in the majors this season or last, plus
+    every club's dated 40-man roster (for players without MLB time yet). Each
+    candidate's roster-entry history then decides where he was on the date:
+
+    * an entry with an MLB club covering the date puts him on that club
+      (active, injured list or optioned);
+    * no entry with any club anywhere covering the date, after an entry that
+      ended earlier, makes him a free agent.
+
+    (The API's own roster lists can't be used directly: for the current year
+    a "season" roster returns only today's players, and dated rosters drop
+    anyone who later left the club.)
+    """
+    team_set = set(team_ids)
+    cands: dict[int, dict] = {}
+    for y in (as_of.year - 1, as_of.year):
+        if as_of < date(y, 2, 1):
+            continue
+        for group in ("hitting", "pitching"):
+            for sp in _fetch_stats(group, {"stats": "season", "season": y}):
+                cands.setdefault(sp["player"]["id"], {})
+    dated = {}
+    for t in team_ids:
+        r = _get(f"teams/{t}/roster", {"rosterType": "40Man", "date": as_of.isoformat()})
+        for x in r.get("roster", []):
+            cands.setdefault(x["person"]["id"], {})
+            dated[x["person"]["id"]] = (t, x.get("status", {}).get("description", ""))
+
+    ids = sorted(cands)
+    day = as_of.isoformat()
+    rosters: dict[int, list[RosterPlayer]] = {t: [] for t in team_ids}
+    free: list[FreeAgent] = []
+    for i in range(0, len(ids), 100):
+        chunk = ids[i : i + 100]
+        d = _get("people", {"personIds": ",".join(map(str, chunk)), "hydrate": "rosterEntries"},
+                 ttl_days=1 if as_of >= date.today() - timedelta(days=7) else 7)
+        for p in d.get("people", []):
+            entries = p.get("rosterEntries", [])
+            covering = [e for e in entries
+                        if (e.get("startDate") or "0000") <= day <= (e.get("endDate") or "9999")]
+            pos = p.get("primaryPosition", {}).get("abbreviation", "")
+            mlb = [e for e in covering if e.get("team", {}).get("id") in team_set]
+            if mlb:
+                e = max(mlb, key=lambda e: e.get("startDate") or "")
+                t = e["team"]["id"]
+                status = e.get("status", {}).get("description", "")
+                if p["id"] in dated and dated[p["id"]][0] == t:
+                    status = dated[p["id"]][1] or status
+                rosters[t].append(RosterPlayer(p["id"], p["fullName"], pos, p.get("birthDate"), status))
+            elif p["id"] in dated:
+                t, status = dated[p["id"]]
+                rosters[t].append(RosterPlayer(p["id"], p["fullName"], pos, p.get("birthDate"), status))
+            elif not covering:
+                ended = [e for e in entries if (e.get("endDate") or "9999") < day]
+                if ended:
+                    last = max(ended, key=lambda e: e.get("endDate"))
+                    free.append(FreeAgent(p["id"], p["fullName"], pos, p.get("birthDate"),
+                                          last.get("team", {}).get("id"), last.get("team", {}).get("name", "")))
+    return rosters, free

@@ -168,6 +168,7 @@ class PlayerValues:
     team_games_played: float
     hit_todate: pd.DataFrame
     pit_todate: pd.DataFrame
+    recent_label: str = ""
 
 
 def _age_on(birth: str | None, on: date) -> float | None:
@@ -228,6 +229,25 @@ def value_all_players(season: int, as_of: date, team_games_played: float
     pp["proj_pit_raa_per_ip"] = pp["wraa"] / (pp["wip"] + PIT_REGRESS_IP)
     pp["proj_sp_share"] = (pp["wsp"] / pp["wip"].replace(0, np.nan)).fillna(0.0)
 
+    # ---------- "recent" stats for the WAR and run-differential models: this
+    # season to date, or (before ~a month of games) last season plus this one.
+    recent_label = f"{season} so far"
+    if hit["PA"].sum() < 30000:
+        ph_full, pp_full = data.season_stats(season - 1)
+        def _combine(a, b):
+            both = pd.concat([x for x in (a, b) if len(x)], ignore_index=True)
+            if not len(both):
+                return a
+            num = [c for c in both.columns if c not in ("player_id", "name", "pos")]
+            agg = {c: "sum" for c in num}
+            agg.update({"name": "last", "pos": "last"})
+            return both.groupby("player_id", as_index=False).agg(agg)
+        hit = _combine(ph_full, hit)
+        pit = _combine(pp_full, pit)
+        recent_label = f"{season - 1}" + (f" + {season} so far" if hv is not None and len(hv) else "")
+        hv = _hitter_values(hit, ctx) if len(hit) else pd.DataFrame(columns=["player_id"])
+        pv = _pitcher_values(pit, ctx) if len(pit) else pd.DataFrame(columns=["player_id"])
+
     # ---------- assemble one row per player
     ids = pd.Index(sorted(set(hv.get("player_id", pd.Series(dtype=int)).tolist())
                           | set(pv.get("player_id", pd.Series(dtype=int)).tolist())), name="player_id")
@@ -247,7 +267,9 @@ def value_all_players(season: int, as_of: date, team_games_played: float
     t["pa_per_g"] = (t["PA"] / tg).clip(upper=4.6)
     t["ip_per_g"] = (t["IP"] / tg).clip(upper=1.3)
     t["war_todate"] = (t["off_rar"] + t["def_runs"] + t["pit_rar"]) / ctx.runs_per_win
-    return PlayerValues(ctx, t, team_games_played, hit, pit), hp, pp
+    pvals = PlayerValues(ctx, t, team_games_played, hit, pit)
+    pvals.recent_label = recent_label
+    return pvals, hp, pp
 
 
 def player_rates(pv: PlayerValues, hp: pd.DataFrame, pp: pd.DataFrame, player_ids: list[int],
@@ -298,6 +320,8 @@ def player_rates(pv: PlayerValues, hp: pd.DataFrame, pp: pd.DataFrame, player_id
             "todate_pit_per_ip": pit_rate,
             "proj_off_per_pa": proj_off,
             "proj_pit_per_ip": proj_pit,
+            "sp_share": float(pp.loc[pid, "proj_sp_share"]) if pid in pp.index
+            else (float(r["sp_share"]) if r is not None else 0.0),
         })
     return pd.DataFrame(rows)
 

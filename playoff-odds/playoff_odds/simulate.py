@@ -72,8 +72,9 @@ def build_setup(teams: pd.DataFrame, sched: pd.DataFrame, as_of) -> SeasonSetup:
     s["is_lg"] = league[s.h] == league[s.a]
     s = s.sort_values(["date", "game_dt", "game_pk"]).reset_index(drop=True)
     cutoff = pd.Timestamp(as_of)
-    played = s[s.date <= cutoff]
-    rem = s[s.date > cutoff].reset_index(drop=True)
+    is_played = (s.date <= cutoff) & s.final
+    played = s[is_played]
+    rem = s[~is_played].reset_index(drop=True)
 
     base_w = np.zeros(T, int)
     base_l = np.zeros(T, int)
