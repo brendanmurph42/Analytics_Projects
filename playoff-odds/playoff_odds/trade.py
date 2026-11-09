@@ -26,7 +26,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from . import data, players, simulate, strength
+from . import contracts, data, players, simulate, strength, value
 
 MODELS = {"war": "WAR (to date)", "proj": "Projection (Marcel)", "rd": "Run differential"}
 
@@ -108,4 +108,51 @@ def run_models(ctx: Context, deltas: pd.DataFrame | None, models: list[str], sim
             if key not in cache:
                 cache[key] = simulate.simulate(ctx.setup, wp, U, seed, noise)
             out[(m, label)] = cache[key]
+    return out
+
+
+# ----------------------------------------------------------------- trade value defaults
+
+
+def player_value_defaults(ctx: Context, rates: pd.DataFrame, growth: float,
+                          custom_specs: dict[int, dict] | None = None) -> list[dict]:
+    """Default trade-value inputs and surplus for each row of ``rates``.
+
+    ``rates`` rows come from ``players.player_rates`` (or custom players) and
+    need a ``to_id`` column (the team whose remaining schedule counts this
+    season). Returns per row: war_season, age, service, priors, pitcher,
+    control, path (ContractPath), salary (average predicted $M/yr), surplus.
+    Used by both the roster dropdown labels and the trade value table so the
+    two always agree.
+    """
+    custom_specs = custom_specs or {}
+    season = ctx.season
+    rpw = ctx.pv.ctx.runs_per_win
+    real_ids = [int(p) for p in rates.player_id if int(p) > 0]
+    contracts.prefetch_histories(real_ids)
+    out = []
+    for _, r in rates.iterrows():
+        pid = int(r.player_id)
+        age = None if pd.isna(r.get("age")) else float(r.age)
+        if pid < 0:
+            spec = custom_specs.get(pid, {})
+            war_s = float(r.get("war_pace", 0.0))
+            svc = float(spec.get("service", 1.0))
+            priors = [war_s] * 3 if svc >= 1 else []
+            pitcher = spec.get("kind") == "Pitcher"
+        else:
+            war_s = float(((r.proj_off_per_pa + r.def_per_pa) * min(r.rem_pa_per_g * 162, 700)
+                           + r.proj_pit_per_ip * min(r.rem_ip_per_g * 162, 220)) / rpw)
+            svc, _ = contracts.player_history(pid, season)
+            priors = [float(players.season_war(season - j).get(pid, 0.0)) for j in (1, 2, 3)]
+            pitcher = r.pos == "P"
+        war_s = round(war_s, 1)
+        control = contracts.default_control_years(svc, age)
+        path = contracts.salary_path(age if age is not None else 27.0, svc, priors,
+                                     value.war_path(war_s, age, control), pitcher, season, growth)
+        rem_frac = float(ctx.rem_games.get(int(r.to_id), 0)) / 162
+        sv = value.surplus_value(war_s, age, control, path.salaries, rem_frac, season, growth)
+        out.append({"war_season": war_s, "age": age, "service": svc, "priors": priors, "pitcher": pitcher,
+                    "control": control, "path": path, "salary": round(float(np.mean(path.salaries)), 1),
+                    "surplus": sv.total})
     return out

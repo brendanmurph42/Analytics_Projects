@@ -290,3 +290,94 @@ def get_people(player_ids: list[int]) -> dict[int, dict]:
                 "name": p.get("fullName"),
             }
     return out
+
+
+# ---------------------------------------------------------------- minor leagues
+
+MILB_LEVELS = {11: "AAA", 12: "AA", 13: "A+", 14: "A", 16: "Rk"}
+
+
+def get_affiliates(team_id: int, season: int) -> dict[int, int]:
+    """Affiliate team id -> sport id (level) for an MLB organization in a season."""
+    d = _get("teams", {"sportIds": ",".join(map(str, MILB_LEVELS)), "season": season})
+    return {t["id"]: t["sport"]["id"] for t in d.get("teams", []) if t.get("parentOrgId") == team_id}
+
+
+@dataclass
+class Prospect:
+    player_id: int
+    name: str
+    pos: str
+    birth_date: str | None
+
+
+def get_org_prospects(team_id: int, as_of: date, exclude: set[int] | None = None) -> list[Prospect]:
+    """Minor leaguers in the organization on ``as_of`` (excluding ``exclude``, e.g. the 40-man).
+
+    Candidates are everyone on an affiliate's roster at any point that season;
+    each player's roster-entry history then decides whether he belonged to
+    this organization on the date (the dated roster endpoints drop players
+    who later left, same as for MLB rosters).
+    """
+    season = as_of.year
+    affiliates = get_affiliates(team_id, season)
+    org_ids = set(affiliates) | {team_id}
+    candidates: dict[int, dict] = {}
+    for aff in affiliates:
+        r = _get(f"teams/{aff}/roster", {"rosterType": "fullRoster", "season": season})
+        for x in r.get("roster", []):
+            candidates.setdefault(x["person"]["id"], x)
+    exclude = exclude or set()
+    ids = sorted(i for i in candidates if i not in exclude)
+    day = as_of.isoformat()
+    out = []
+    for i in range(0, len(ids), 100):
+        chunk = ids[i : i + 100]
+        d = _get("people", {"personIds": ",".join(map(str, chunk)), "hydrate": "rosterEntries"}, ttl_days=7)
+        for p in d.get("people", []):
+            if p["id"] in exclude:
+                continue
+            here = any(
+                e.get("team", {}).get("id") in org_ids
+                and (e.get("startDate") or "0000") <= day <= (e.get("endDate") or "9999")
+                for e in p.get("rosterEntries", [])
+            )
+            if here:
+                out.append(Prospect(p["id"], p["fullName"],
+                                    p.get("primaryPosition", {}).get("abbreviation", ""), p.get("birthDate")))
+    return out
+
+
+def milb_stats_to_date(season: int, as_of: date) -> pd.DataFrame:
+    """Season-to-date minor-league hitting and pitching lines, one row per player per level."""
+    ttl = 1 if as_of >= date.today() else None
+    rows = []
+    for sport, level in MILB_LEVELS.items():
+        base = {"stats": "byDateRange", "season": season, "startDate": f"{season}-02-01",
+                "endDate": as_of.isoformat(), "sportId": sport}
+        for group in ("hitting", "pitching"):
+            offset = 0
+            while True:
+                d = _get("stats", {**base, "group": group, "playerPool": "ALL", "limit": 2000,
+                                   "offset": offset}, ttl_days=ttl)
+                s = d["stats"][0] if d.get("stats") else {"splits": []}
+                for sp in s["splits"]:
+                    st = sp["stat"]
+                    rows.append({
+                        "player_id": sp["player"]["id"], "level": level, "sport": sport, "group": group,
+                        "PA": int(st.get("plateAppearances", 0) or 0), "AB": int(st.get("atBats", 0) or 0),
+                        "H": int(st.get("hits", 0) or 0), "2B": int(st.get("doubles", 0) or 0),
+                        "3B": int(st.get("triples", 0) or 0), "HR": int(st.get("homeRuns", 0) or 0),
+                        "BB": int(st.get("baseOnBalls", 0) or 0), "HBP": int(st.get("hitByPitch", 0) or 0),
+                        "SF": int(st.get("sacFlies", 0) or 0), "SO": int(st.get("strikeOuts", 0) or 0),
+                        "SB": int(st.get("stolenBases", 0) or 0), "OUTS": int(st.get("outs", 0) or 0),
+                        "BF": int(st.get("battersFaced", 0) or 0), "ER": int(st.get("earnedRuns", 0) or 0),
+                    })
+                offset += 2000
+                if offset >= s.get("totalSplits", 0) or not s["splits"]:
+                    break
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    keys = ["player_id", "level", "sport", "group"]
+    return df.groupby(keys, as_index=False).sum(numeric_only=True)

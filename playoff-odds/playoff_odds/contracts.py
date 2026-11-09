@@ -204,17 +204,34 @@ def salary_path(age: float, service: float, prior_war: list[float], war_by_year:
 
 # ----------------------------------------------------------------- current players
 
+_HISTORY: dict[int, dict] = {}
+
+
+def _store_people(people: list[dict]) -> None:
+    for p in people:
+        years = set()
+        for block in p.get("stats", []):
+            for sp in block.get("splits", []):
+                if sp.get("sport", {}).get("id", 1) == 1 and "season" in sp:
+                    years.add(int(sp["season"]))
+        _HISTORY[p["id"]] = {"debut": p.get("mlbDebutDate"), "years": years}
+
+
+def prefetch_histories(player_ids: list[int]) -> None:
+    """Load MLB debut dates and seasons played for many players (100 per request)."""
+    need = sorted({int(i) for i in player_ids if int(i) > 0 and int(i) not in _HISTORY})
+    for i in range(0, len(need), 100):
+        chunk = need[i : i + 100]
+        d = data._get("people", {"personIds": ",".join(map(str, chunk)),
+                                 "hydrate": "stats(group=[hitting,pitching],type=[yearByYear],sportId=1)"},
+                      ttl_days=30)
+        _store_people(d.get("people", []))
+        for pid in chunk:
+            _HISTORY.setdefault(pid, {"debut": None, "years": set()})
+
+
 def player_history(player_id: int, season: int) -> tuple[float, list[int]]:
     """(approximate service before ``season``, MLB seasons played) from the Stats API."""
-    d = data._get(f"people/{player_id}",
-                  {"hydrate": "stats(group=[hitting,pitching],type=[yearByYear],sportId=1)"}, ttl_days=30)
-    people = d.get("people", [])
-    if not people:
-        return 0.0, []
-    p = people[0]
-    years = set()
-    for block in p.get("stats", []):
-        for sp in block.get("splits", []):
-            if sp.get("sport", {}).get("id", 1) == 1 and "season" in sp:
-                years.add(int(sp["season"]))
-    return service_years(p.get("mlbDebutDate"), years, season), sorted(years)
+    prefetch_histories([player_id])
+    h = _HISTORY[int(player_id)]
+    return service_years(h["debut"], h["years"], season), sorted(h["years"])

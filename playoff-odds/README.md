@@ -64,6 +64,18 @@ Each team's net = value received − value sent + a **contender premium**: the t
 
 A team **rejects** the trade if its net loss is bigger than the tolerance (default 15% of the deal's size, minimum $3M). The app names who says no and how much value would fix it, and still shows the playoff odds.
 
+## Prospects
+
+Turn on **Include prospects** to add each organization's minor leaguers: everyone off the 40-man roster who belonged to the club on the chosen date. They're sorted by highest level, then youngest for that level, and each shows his stat line at his highest level this season.
+
+For each prospect you choose a **Future Value grade** (FanGraphs-style 20–80 scale) and an ETA (seasons until he reaches the majors). The stats are only a reference. The app turns the grade into surplus value with the same tools used for major leaguers:
+
+- **WAR if he reaches his grade:** 50 ≈ 2 WAR (average regular), 60 ≈ 4 (all-star level), 70 ≈ 6 (superstar).
+- **Bust risk:** each grade gets a realization factor. Pitchers carry 25% more risk, and each year of ETA beyond one adds 8%.
+- **Control and salary:** six seasons of team control from his debut, with salaries predicted by the contract comps model, discounted from his ETA.
+
+The risk factors are tuned so a hitter about a year away lands near rough public prospect valuations: about $110M for a 70, $50M for a 60, $15M for a 50, and $5M for a 45. Those targets approximate published research rather than exact figures, so adjust `REALIZATION` in `playoff_odds/prospects.py` if you prefer different ones. Prospects affect trade value only, not this season's playoff odds.
+
 ## Data sources
 
 - Stats, schedules, rosters: MLB Stats API (personal, non-commercial use).
@@ -89,6 +101,7 @@ playoff_odds/simulate.py  Season simulator + tiebreakers
 playoff_odds/trade.py     Trade deltas per model, before/after runs
 playoff_odds/value.py     Surplus value and accept/reject verdicts
 playoff_odds/contracts.py Contract predictions from historical comps
+playoff_odds/prospects.py Prospect value from FV grades, minor-league stat lines
 playoff_odds/resources/   Comps table + league-average salary series
 scripts/                  One-time build script for the comps table
 tests/                    Integration tests against real seasons

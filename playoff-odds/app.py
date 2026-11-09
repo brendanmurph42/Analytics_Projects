@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from playoff_odds import contracts, data, players, trade, value
+from playoff_odds import contracts, data, players, prospects, trade, value
 
 st.set_page_config(page_title="Trade Playoff Odds", page_icon="⚾", layout="wide")
 
@@ -34,6 +34,30 @@ def season_bounds(season: int):
 @st.cache_data(show_spinner=False)
 def roster(team_id: int, as_of: date):
     return data.get_roster(team_id, as_of)
+
+
+@st.cache_data(show_spinner="Estimating contracts and surplus values…")
+def roster_surplus(season: int, as_of: date, team_id: int, growth: float) -> dict[int, float]:
+    """Default surplus value ($M) for everyone on a roster, for the dropdown labels."""
+    ctx = get_ctx(season, as_of)
+    r = data.get_roster(team_id, as_of)
+    if not r:
+        return {}
+    rates = players.player_rates(ctx.pv, ctx.hp, ctx.pp, [p.player_id for p in r], as_of,
+                                 {p.player_id: p.pos for p in r})
+    rates["to_id"] = team_id
+    d = trade.player_value_defaults(ctx, rates, growth)
+    return {int(pid): x["surplus"] for pid, x in zip(rates.player_id, d)}
+
+
+@st.cache_data(show_spinner="Loading minor-league rosters…")
+def org_prospects(team_id: int, as_of: date, exclude: tuple[int, ...]):
+    return data.get_org_prospects(team_id, as_of, set(exclude))
+
+
+@st.cache_data(show_spinner="Loading minor-league stats (first time for a date takes ~15s)…")
+def milb_stats(season: int, as_of: date):
+    return data.milb_stats_to_date(season, as_of)
 
 
 @st.cache_data(show_spinner="Simulating seasons…", max_entries=64)
@@ -112,14 +136,23 @@ with c2:
                           index=opts_b.index(116) if 116 in opts_b else 0)
 
 
+def money(m: float) -> str:
+    """$M figure for labels: $55M, -$12M, $0.4M."""
+    a = abs(m)
+    txt = f"${a:.1f}M" if a < 1 else f"${a:.0f}M"
+    return ("-" if m < 0 else "") + txt
+
+
 def roster_labels(team_id):
     r = roster(team_id, as_of)
     tbl = ctx.pv.table
+    sv = roster_surplus(season, as_of, team_id, round(growth, 4))
     lab, pos = {}, {}
     for p in sorted(r, key=lambda p: -(tbl.loc[p.player_id, "war_todate"] if p.player_id in tbl.index else -9)):
         war = tbl.loc[p.player_id, "war_todate"] if p.player_id in tbl.index else 0.0
         status = "" if p.status in ("Active", "") else f" · {p.status}"
-        lab[p.player_id] = f"{p.name} ({p.pos}, {war:.1f} WAR){status}"
+        val = f", {money(sv[p.player_id])}" if p.player_id in sv else ""
+        lab[p.player_id] = f"{p.name} ({p.pos}, {war:.1f} WAR{val}){status}"
         pos[p.player_id] = p.pos
     return lab, pos
 
@@ -133,6 +166,8 @@ with c1:
 with c2:
     send_b = st.multiselect(f"{teams.loc[team_b, 'short']} send", list(lab_b), format_func=lab_b.get,
                             placeholder="Players leaving Team B")
+st.caption("Each player shows WAR so far this season and his default **surplus value**: projected production "
+           "minus predicted salary over his years of control. Trade value below lets you edit the contract.")
 
 # ------------------------------------------------------------------ custom players
 
@@ -240,6 +275,102 @@ if library:
     for i in join_b:
         custom_in.append((by_id[i], team_b, team_a if from_other else None))
 
+# ------------------------------------------------------------------ prospects
+
+prospect_values: list[dict] = []
+pros_a, pros_b = [], []
+include_prospects = st.toggle(
+    "Include prospects", value=False,
+    help="Adds each organization's minor leaguers (off the 40-man roster on this date). "
+         "You grade each prospect, and the app turns the grade into trade value.",
+)
+if include_prospects:
+    milb = milb_stats(season, as_of)
+    p_info: dict[int, dict] = {}
+
+    def prospect_labels(team_id, forty_ids):
+        lst = org_prospects(team_id, as_of, tuple(sorted(forty_ids)))
+        lab, rows = {}, []
+        for pr in lst:
+            age = players._age_on(pr.birth_date, as_of)
+            sm = prospects.summarize_stats(milb, pr.player_id, age)
+            p_info[pr.player_id] = {"name": pr.name, "pos": pr.pos, "age": age, **sm, "org": team_id}
+            rank = prospects.LEVEL_ORDER.index(sm["level"]) if sm["level"] else 9
+            rows.append((rank, sm["age_vs_level"] if sm["age_vs_level"] is not None else 9, pr.player_id))
+        for _, _, pid in sorted(rows):
+            i = p_info[pid]
+            agetxt = f"{i['age']:.0f}" if i["age"] is not None else "?"
+            lab[pid] = f"{i['name']} ({i['pos']}, {agetxt}) · {i['line']}"
+        return lab
+
+    plab_a = prospect_labels(team_a, set(lab_a))
+    plab_b = prospect_labels(team_b, set(lab_b))
+    st.caption("Sorted by highest level, then youngest for that level. Being young for a level is a "
+               "classic sign of a good prospect.")
+    c1, c2 = st.columns(2)
+    with c1:
+        pros_a = st.multiselect(f"{teams.loc[team_a, 'short']} prospects sent", list(plab_a),
+                                format_func=plab_a.get, placeholder="Prospects leaving Team A")
+    with c2:
+        pros_b = st.multiselect(f"{teams.loc[team_b, 'short']} prospects sent", list(plab_b),
+                                format_func=plab_b.get, placeholder="Prospects leaving Team B")
+
+    if pros_a or pros_b:
+        st.subheader("Prospects in the deal")
+        st.caption(
+            "Choose a **Future Value grade** (20–80 scouting scale) for each prospect. The stats are only a "
+            "reference. ETA is the number of seasons until he's expected to reach the majors. Value accounts "
+            "for bust risk (higher for pitchers and for prospects further away), six years of team control, "
+            "and predicted pre-arbitration and arbitration salaries. Prospects don't change this season's "
+            "playoff odds."
+        )
+        prow = []
+        for pid in pros_a + pros_b:
+            i = p_info[pid]
+            from_id = team_a if pid in pros_a else team_b
+            pitcher = i["pitcher_stats"] or i["pos"] == "P"
+            prow.append({
+                "pid": pid, "Prospect": i["name"],
+                "Grade": prospects.GRADE_LABELS[45],
+                "ETA (yrs)": prospects.DEFAULT_ETA.get(i["level"], 3),
+                "Type": "Pitcher" if pitcher else "Hitter",
+                "Pos": i["pos"],
+                "Age": None if i["age"] is None else round(i["age"], 1),
+                "Age vs level": i["age_vs_level"], "This season": i["line"],
+                "From": teams.loc[from_id, "abbr"], "To": teams.loc[team_b if from_id == team_a else team_a, "abbr"],
+            })
+        pdf = pd.DataFrame(prow)
+        pedit = st.data_editor(
+            pdf.drop(columns=["pid"]),
+            column_config={
+                "Grade": st.column_config.SelectboxColumn(
+                    "FV grade", options=list(prospects.GRADE_LABELS.values()), required=True,
+                    help="FanGraphs-style Future Value. 50 = average regular, 60 = all-star level, "
+                         "70 = superstar. Most organizations have only a few prospects at 55+."),
+                "ETA (yrs)": st.column_config.NumberColumn(min_value=0, max_value=6, step=1),
+                "Type": st.column_config.SelectboxColumn(options=["Hitter", "Pitcher"], required=True),
+                "Age": st.column_config.NumberColumn(format="%.1f"),
+                "Age vs level": st.column_config.NumberColumn(
+                    format="%+.1f", help="Years older (+) or younger (−) than a typical player at his level."),
+            },
+            disabled=["Prospect", "Pos", "From", "To", "Age", "Age vs level", "This season"],
+            hide_index=True, width="stretch", key="prospect_editor",
+        )
+        grade_of = {v: k for k, v in prospects.GRADE_LABELS.items()}
+        for k, r in pdf.iterrows():
+            grade = grade_of[pedit["Grade"].iloc[k]]
+            pv = prospects.prospect_value(grade, int(pedit["ETA (yrs)"].iloc[k]),
+                                          pedit["Type"].iloc[k] == "Pitcher",
+                                          None if pd.isna(r["Age"]) else float(r["Age"]), season, growth)
+            from_id = team_a if r.pid in pros_a else team_b
+            prospect_values.append({
+                "name": f"{r['Prospect']} (prospect, FV {grade})",
+                "to_id": team_b if from_id == team_a else team_a, "from_id": from_id,
+                "surplus": pv.surplus, "production": pv.production, "salary": pv.salary,
+                "war_total": pv.war_total,
+            })
+
+value_players: list[dict] = []
 moves = None
 if send_a or send_b or custom_in:
     positions = {**pos_a, **pos_b}
@@ -314,42 +445,25 @@ if send_a or send_b or custom_in:
         "Edit any of them to match the real contract. "
         f"Market rate this season: ${value.dollars_per_war(season):.1f}M per WAR."
     )
-    is_custom = (rates.player_id < 0).to_numpy()
-    war_season = np.where(
-        is_custom,
-        rates.get("war_pace", pd.Series(np.nan, index=rates.index)),
-        ((rates.proj_off_per_pa + rates.def_per_pa) * (rates.rem_pa_per_g * 162).clip(upper=700)
-         + rates.proj_pit_per_ip * (rates.rem_ip_per_g * 162).clip(upper=220)) / rpw,
-    )
-    rates["war_season"] = np.round(war_season.astype(float), 1)
-    ages = [None if pd.isna(a) else float(a) for a in rates.age]
     custom_by_id = {x["id"]: x for x in library}
-
-    services, priors, pitch_flags = [], [], []
-    for k, r in rates.reset_index(drop=True).iterrows():
-        pid = int(r.player_id)
-        if pid < 0:
-            spec = custom_by_id.get(pid, {})
-            services.append(float(spec.get("service", 1.0)))
-            priors.append([float(r.war_season)] * 3 if spec.get("service", 1.0) >= 1 else [])
-            pitch_flags.append(spec.get("kind") == "Pitcher")
-        else:
-            svc, _ = contracts.player_history(pid, season)
-            services.append(svc)
-            priors.append([float(players.season_war(season - j).get(pid, 0.0)) for j in (1, 2, 3)])
-            pitch_flags.append(r.pos == "P")
+    rates = rates.reset_index(drop=True)
+    defaults = trade.player_value_defaults(ctx, rates, growth, custom_by_id)
+    ages = [d["age"] for d in defaults]
+    services = [d["service"] for d in defaults]
+    priors = [d["priors"] for d in defaults]
+    pitch_flags = [d["pitcher"] for d in defaults]
+    paths = [d["path"] for d in defaults]
+    rates["war_season"] = [d["war_season"] for d in defaults]
     rates["service"] = np.round(services, 1)
-    rates["control"] = [contracts.default_control_years(sv, a) for sv, a in zip(services, ages)]
+    rates["control"] = [d["control"] for d in defaults]
+    rates["salary"] = [d["salary"] for d in defaults]
+    rates["cls"] = [pth.first.cls for pth in paths]
 
     def predicted_path(k, war_s, control):
         wars = value.war_path(war_s, ages[k], control)
         return contracts.salary_path(ages[k] if ages[k] is not None else 27.0, services[k], priors[k],
                                      wars, pitch_flags[k], season, growth)
 
-    paths = [predicted_path(k, float(rates.war_season.iloc[k]), int(rates.control.iloc[k]))
-             for k in range(len(rates))]
-    rates["salary"] = [round(float(np.mean(pth.salaries)), 1) for pth in paths]
-    rates["cls"] = [pth.first.cls for pth in paths]
     rates["age_disp"] = [None if a is None else int(a) for a in ages]
     vedit = st.data_editor(
         rates[["name", "from", "to", "age_disp", "service", "cls", "war_season", "control", "salary"]],
@@ -434,9 +548,10 @@ st.divider()
 
 # ------------------------------------------------------------------ trade verdict
 
-if moves is not None:
+all_values = value_players + prospect_values
+if all_values:
     pdelta = {t: blend("after", "playoff", t) - blend("before", "playoff", t) for t in (team_a, team_b)}
-    verdicts = value.evaluate(value_players, pdelta, (team_a, team_b), spot_value, tol_pct)
+    verdicts = value.evaluate(all_values, pdelta, (team_a, team_b), spot_value, tol_pct)
     st.subheader("Trade verdict")
     no = [v for v in verdicts.values() if not v.accepts]
     if not no:
@@ -466,7 +581,7 @@ if moves is not None:
             "From": teams.loc[p["from_id"], "abbr"] if p["from_id"] else "Outside",
             "Proj. WAR (control period)": p["war_total"], "Production ($M)": p["production"],
             "Salary owed ($M)": p["salary"], "Surplus ($M)": p["surplus"],
-        } for p in value_players]).style.format({
+        } for p in all_values]).style.format({
             "Proj. WAR (control period)": "{:.1f}", "Production ($M)": "{:.1f}",
             "Salary owed ($M)": "{:.1f}", "Surplus ($M)": "{:+.1f}"}), hide_index=True, width="stretch")
         st.caption(f"Contender premium = change in playoff odds × ${spot_value}M per playoff spot "
@@ -642,6 +757,11 @@ service class, by age, service time and recent WAR. Each comp's salary is expres
 season's league-average salary, then rescaled to the league average for each future season, which grows
 with the salary-growth setting. Each team's net is value received − value sent + a contender premium (change in playoff odds ×
 the value of a playoff spot). A team rejects if its net loss is bigger than the tolerance you set in the sidebar.
+
+**Prospects.** You choose a Future Value grade and an ETA. The grade sets the WAR he'd produce if he
+pans out (50 ≈ 2, 60 ≈ 4, 70 ≈ 6). A bust-risk factor (higher for pitchers and for prospects further
+away) scales that down. Six years of control at predicted pre-arb and arbitration salaries give the surplus
+value, discounted from his debut. Prospects affect trade value only, not this season's odds.
 
 **Not modeled.** Park factors, fielding metrics beyond the positional adjustment, reliever leverage,
 injuries after the as-of date (edit playing time instead), and postseason series odds.
