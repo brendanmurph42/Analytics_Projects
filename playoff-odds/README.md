@@ -41,6 +41,35 @@ The app converts that to runs per PA or IP using the selected season's league co
 
 Real players don't need manual updates either. Stats and rosters come live from the MLB Stats API for whatever date you pick.
 
+## Trade value and verdicts
+
+Every player in the deal gets a **surplus value** in dollars:
+
+> projected WAR × market $/WAR − salary, over this season's remaining games plus each year of team control
+
+WAR ages (young players improve, players past 30 decline), $/WAR starts at the season's market rate ($8.0M in 2022 to $9.3M in 2026) and grows with salaries, and future dollars are discounted 8% a year.
+
+### Predicted contracts from historical comps
+
+MLB's public data has no contracts, so salaries are **predicted from comparable players**:
+
+1. Each player's MLB service time is estimated from his debut date, with partial credit for the debut season and a year for every later season in the majors. That puts him in a class: pre-arbitration (<3 years), arbitration (3–6), or free agent (6+). It also sets the years of control.
+2. The app finds the **30 most similar player seasons from 2000–2016** in the same class, by age, service and recent WAR (3/2/1 over the prior three seasons). These ~14,000 seasons come from the Lahman database, the last free source with salaries.
+3. Each comp's salary is stored as a **multiple of that season's league-average salary**, which strips out inflation. The median multiple is applied to the league average for each target season. Known averages (AP opening-day study) run through 2025, and later seasons **grow at the long-run trend**: about 3.4% a year over the last 20 years, adjustable in the sidebar.
+4. Pre-arb and arbitration players are re-predicted every season, so raises show up. A veteran's salary is predicted once and held flat, like a signed contract.
+
+On held-out 2014–2016 salaries (predicted only from 2000–2013 comps), the typical error is about 18%, and 83% of predictions land within 2x of the actual salary. Errors are largest for stars on early extensions, so type the real figure in the salary column when you know it. The **Contract predictions** expander shows each player's salary path and closest comps.
+
+Each team's net = value received − value sent + a **contender premium**: the team's change in playoff odds × the value of a playoff spot (default $40M, set in the sidebar). This lets a contender overpay for help now, and it costs a contending seller something to weaken itself.
+
+A team **rejects** the trade if its net loss is bigger than the tolerance (default 15% of the deal's size, minimum $3M). The app names who says no and how much value would fix it, and still shows the playoff odds.
+
+## Data sources
+
+- Stats, schedules, rosters: MLB Stats API (personal, non-commercial use).
+- Historical salaries for contract comps: [Lahman Baseball Database](https://sabr.org/lahman-database/) (SABR, CC BY-SA 3.0). The derived table in `playoff_odds/resources/` is shared under the same license. To rebuild it, see `scripts/build_contract_comps.py`, which needs `pip install pyreadr`.
+- League-average salaries for 2017–2025: AP opening-day salary study.
+
 ## Simulation details
 
 - Monte Carlo over every remaining game. Win probability uses log5 with home-field advantage, and each simulated season draws its own true-talent levels to reflect uncertainty.
@@ -58,6 +87,10 @@ playoff_odds/players.py   Player valuation (WAR-style rates, Marcel projections)
 playoff_odds/strength.py  Team talent estimates, log5 game probabilities
 playoff_odds/simulate.py  Season simulator + tiebreakers
 playoff_odds/trade.py     Trade deltas per model, before/after runs
+playoff_odds/value.py     Surplus value and accept/reject verdicts
+playoff_odds/contracts.py Contract predictions from historical comps
+playoff_odds/resources/   Comps table + league-average salary series
+scripts/                  One-time build script for the comps table
 tests/                    Integration tests against real seasons
 ```
 

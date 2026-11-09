@@ -288,7 +288,7 @@ def player_rates(pv: PlayerValues, hp: pd.DataFrame, pp: pd.DataFrame, player_id
             proj_pit = 0.0
 
         rows.append({
-            "player_id": pid, "name": name, "pos": pos,
+            "player_id": pid, "name": name, "pos": pos, "age": age,
             "PA": pa, "IP": round(ip, 1),
             "war_todate": float(r["war_todate"]) if r is not None else 0.0,
             "rem_pa_per_g": 0.0 if is_pitcher and pa < 10 else (float(r["pa_per_g"]) if r is not None else 0.0),
@@ -300,6 +300,29 @@ def player_rates(pv: PlayerValues, hp: pd.DataFrame, pp: pd.DataFrame, player_id
             "proj_pit_per_ip": proj_pit,
         })
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------- past seasons
+
+
+_SEASON_WAR: dict[int, pd.Series] = {}
+
+
+def season_war(season: int) -> pd.Series:
+    """Full-season WAR by player_id for a completed season (same framework)."""
+    if season not in _SEASON_WAR:
+        h, p = data.season_stats(season)
+        if len(h) == 0:
+            _SEASON_WAR[season] = pd.Series(dtype=float)
+        else:
+            ctx = build_context(season, h, p)
+            hv, pv = _hitter_values(h, ctx), _pitcher_values(p, ctx)
+            w = pd.concat([
+                pd.Series(((hv.off_rar + hv.def_runs) / ctx.runs_per_win).values, index=hv.player_id.values),
+                pd.Series((pv.pit_rar / ctx.runs_per_win).values, index=pv.player_id.values),
+            ])
+            _SEASON_WAR[season] = w.groupby(level=0).sum()
+    return _SEASON_WAR[season]
 
 
 # --------------------------------------------------------------- custom players
@@ -346,7 +369,7 @@ def custom_player_rates(spec: dict, ctx: LeagueContext) -> dict:
     pace = CUSTOM_PACE["Hitter"] if spec["kind"] == "Hitter" else CUSTOM_PACE[spec.get("role") or "SP"]
     war_pace = ((off + def_) * pace if spec["kind"] == "Hitter" else pit * pace) / ctx.runs_per_win
     return {
-        "name": spec["name"], "pos": pos, "PA": 0.0, "IP": 0.0, "war_todate": float("nan"),
+        "name": spec["name"], "pos": pos, "age": float(spec.get("age") or 27), "PA": 0.0, "IP": 0.0, "war_todate": float("nan"),
         "war_pace": war_pace,
         "rem_pa_per_g": pa_g, "rem_ip_per_g": ip_g,
         "todate_off_per_pa": off, "def_per_pa": def_, "todate_pit_per_ip": pit,
